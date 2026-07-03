@@ -1,0 +1,88 @@
+   Compiling woflos v0.4.0 (/mnt/c/github/wofl-os/v.0.3.0)
+warning: variable `result` is assigned to, but never used
+  --> src/user_test.rs:22:9
+   |
+22 |     let result: usize;
+   |         ^^^^^^
+   |
+   = note: consider using `_result` instead
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `result` is never read
+  --> src/user_test.rs:24:9
+   |
+24 | /         asm!(
+25 | |             "li a7, {syscall}",  // Load syscall number
+26 | |             "ecall",              // Trap to kernel
+27 | |             "mv {result}, a0",    // Get return value
+...  |
+30 | |             out("a7") _,
+31 | |         );
+   | |_________^
+   |
+   = help: maybe it is overwritten before being read?
+   = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+  --> src/main.rs:47:22
+   |
+47 |     let kernel_end = unsafe { &raw const __kernel_end as *const u8 as usize };
+   |                      ^^^^^^ unnecessary `unsafe` block
+   |
+   = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `print_hex` is never used
+  --> src/uart.rs:80:12
+   |
+ 8 | impl Uart {
+   | --------- method in this implementation
+...
+80 |     pub fn print_hex(&self, n: u64) {
+   |            ^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: direct cast of function item into an integer
+  --> src/main.rs:70:43
+   |
+70 |     let user_entry = user_test::user_main as usize;
+   |                                           ^^^^^^^^
+   |
+   = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+   |
+70 |     let user_entry = user_test::user_main as *const () as usize;
+   |                                           ++++++++++++
+
+warning: direct cast of function item into an integer
+  --> src/trap.rs:33:44
+   |
+33 |             handler = in(reg) _trap_vector as usize,
+   |                                            ^^^^^^^^
+   |
+help: first cast to a pointer `as *const ()`
+   |
+33 |             handler = in(reg) _trap_vector as *const () as usize,
+   |                                            ++++++++++++
+
+warning: creating a shared reference to mutable static
+  --> src/user_test.rs:57:9
+   |
+57 |         USER_STACK.as_ptr() as usize + USER_STACK.len()
+   |         ^^^^^^^^^^^^^^^^^^^ shared reference to mutable static
+   |
+   = note: shared references to mutable statics are dangerous; it's undefined behavior if the static is mutated or if a mutable reference is created for it while the shared reference lives
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
+   = note: `#[warn(static_mut_refs)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
+
+warning: creating a shared reference to mutable static
+  --> src/user_test.rs:57:40
+   |
+57 |         USER_STACK.as_ptr() as usize + USER_STACK.len()
+   |                                        ^^^^^^^^^^^^^^^^ shared reference to mutable static
+   |
+   = note: shared references to mutable statics are dangerous; it's undefined behavior if the static is mutated or if a mutable reference is created for it while the shared reference lives
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
+
+warning: `woflos` (bin "woflos") generated 8 warnings (run `cargo fix --bin "woflos" -p woflos` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 10.12s

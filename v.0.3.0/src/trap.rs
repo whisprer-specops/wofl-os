@@ -36,13 +36,15 @@ pub fn init() {
         // Enable supervisor interrupts (we'll need timer later)
         asm!("csrsi sstatus, 0x2"); // SIE bit
         
-        // Delegate U-mode exceptions to S-mode (already in S-mode)
-        // This is important: ecall from U-mode causes exception in S-mode
-        asm!("csrw sedeleg, {val}", val = in(reg) 0usize);
     }
 
     crate::kprintln!("[TRAP] Layer 1 initialized - context switching ready");
 }
+
+// No exception delegation: OpenSBI boots us into S-mode and the kernel owns
+// every trap via stvec. A U-mode ecall traps to S-mode by default — the old
+// sedeleg/sideleg regs were part of the never-ratified "N" extension (removed
+// from the spec), which is why the assembler rejected them.
 
 /// Create a fake user context for testing
 pub fn create_test_user_context(entry: usize, stack: usize) -> TrapFrame {
