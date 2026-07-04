@@ -142,3 +142,47 @@ pub unsafe fn translate(root: usize, va: usize) -> Option<(usize, usize)> {
     }
     None
 }
+
+// ---- Layer 4: address-space teardown ----
+
+use super::frame::free_frame;
+
+/// Recursively free one page-table level. Frees: all child PT frames (every
+/// table under a per-process root is owned by that root, including the
+/// replicated kernel-side tables), and leaf TARGETS only for 4 KiB U-bit
+/// leaves (the process's own code/stack frames). Kernel leaves (S-only, and
+/// always 2 MiB megapages in this kernel) point at memory the process merely
+/// REFERENCES - freeing those targets would hand the kernel's own RAM back to
+/// the allocator. Belt and braces: target-free requires level==0 AND PTE_U.
+unsafe fn destroy_table(table_pa: usize, level: usize) {
+    for i in 0..512 {
+        let pte = (table_pa as *const u64).add(i).read_volatile() as usize;
+        if pte & PTE_V == 0 { continue; }
+        if pte & (PTE_R | PTE_W | PTE_X) != 0 {
+            // Leaf. Free the target only if it's a user-owned 4 KiB page.
+            if level == 0 && (pte & PTE_U) != 0 {
+                free_frame((pte >> 10) << PPN_SHIFT);
+            }
+        } else {
+            // Pointer to a child table: recurse (depth <= 2), then free it.
+            let child = (pte >> 10) << PPN_SHIFT;
+            destroy_table(child, level - 1);
+            free_frame(child);
+        }
+    }
+}
+
+/// Tear down an entire per-process address space, returning every owned frame
+/// (page tables at all levels + U-bit leaf targets) to the allocator.
+///
+/// ⚠️ SAFETY: `root` MUST NOT be the active satp root. Freeing the page tables
+/// the MMU is currently walking = the next alloc scribbles over live
+/// translation state -> a delayed fault that looks unrelated. Callers switch
+/// satp AWAY first (to the next process's root, or kernel_root()).
+/// Never call on kernel_root() itself.
+pub unsafe fn destroy_root(root: usize) {
+    debug_assert!(root != current_root(), "destroy_root: tearing down the ACTIVE root");
+    debug_assert!(root != kernel_root(), "destroy_root: tearing down the KERNEL root");
+    destroy_table(root, 2);
+    free_frame(root);
+}

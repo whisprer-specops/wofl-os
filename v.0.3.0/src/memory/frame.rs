@@ -62,6 +62,23 @@ impl FrameAllocator {
         None // Out of memory!
     }
     
+    /// Free a previously allocated frame. Panics LOUDLY on misuse:
+    /// unaligned PA, PA outside the managed range, or double-free. A silent
+    /// double-free means two owners of one frame later - a delayed, unrelated-
+    /// looking corruption bug. We want the crash at the actual mistake.
+    pub fn free(&self, pa: usize) {
+        assert!(pa % PAGE_SIZE == 0, "free: unaligned PA");
+        assert!(pa >= self.start_addr, "free: PA below managed range");
+        let frame = (pa - self.start_addr) / PAGE_SIZE;
+        assert!(frame < self.total_frames, "free: PA above managed range");
+        let word_idx = frame / (core::mem::size_of::<usize>() * 8);
+        let bit_idx = frame % (core::mem::size_of::<usize>() * 8);
+        let prev = self.bitmap[word_idx].fetch_and(!(1 << bit_idx), Ordering::AcqRel);
+        assert!(prev & (1 << bit_idx) != 0, "free: DOUBLE FREE detected");
+        // Hint the allocator at the fresh hole for quick reuse.
+        self.next_free.store(frame, Ordering::Release);
+    }
+
     /// Get statistics about memory usage
     #[allow(dead_code)]
     pub fn stats(&self) -> (usize, usize) {
@@ -99,6 +116,15 @@ pub fn alloc_frame() -> Option<usize> {
     unsafe {
         let allocator = &raw const FRAME_ALLOCATOR;
         (*allocator).alloc()
+    }
+}
+
+/// Free a physical frame (panics on double-free / bad PA)
+#[allow(dead_code)]
+pub fn free_frame(pa: usize) {
+    unsafe {
+        let allocator = &raw const FRAME_ALLOCATOR;
+        (*allocator).free(pa)
     }
 }
 

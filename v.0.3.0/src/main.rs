@@ -8,6 +8,7 @@ use core::arch::asm;
 use core::panic::PanicInfo;
 
 mod uart;
+mod sbi;
 mod memory;
 mod syscall;
 mod trap;
@@ -73,11 +74,21 @@ fn kernel_main_inner() -> ! {
     // Layer 4 step B2a: spawn TWO processes in separate address spaces.
     // A yields immediately; the cooperative switch carries execution into B,
     // which exits sentinel 5. Proves save-frame/switch-satp/restore-frame.
-    let (a_src, a_len) = user_prog::image_a();
-    let (b_src, b_len) = user_prog::image_b();
+    let (used0, total0) = memory::frame::get_stats();
+    crate::kprintln!("[L4] frame baseline before spawn: {}/{} in use", used0, total0);
+
+    // Blocking-IPC test: RECEIVER runs first, hits an empty queue, BLOCKS.
+    // Sender then runs, sends (waking the receiver), exits; receiver restarts
+    // its recv, gets the message, exits 7 - the FINAL exit this time.
+    // Preemption test: two spinners that never voluntarily give up the CPU.
+    // Timer armed LAST, just before entering user mode - S-mode keeps
+    // sstatus.SIE=0 so the tick can only ever land while in U-mode.
+    let (a_src, a_len) = user_prog::image_spin_a();
+    let (b_src, b_len) = user_prog::image_spin_b();
     unsafe {
-        process::spawn(a_src, a_len);   // pid 1, slot 0
-        process::spawn(b_src, b_len);   // pid 2, slot 1
+        process::spawn(a_src, a_len);   // pid 1: exits 11
+        process::spawn(b_src, b_len);   // pid 2: exits 22
+        trap::enable_timer();
         process::run_first(0)
     }
 }

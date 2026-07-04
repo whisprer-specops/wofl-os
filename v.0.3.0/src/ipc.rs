@@ -239,6 +239,9 @@ pub fn sys_send(frame: &mut TrapFrame) {
         msg.checksum = compute_checksum(&msg);
 
         route_send(&msg)?;
+        // Message queued locally: wake any receivers blocked on the endpoint.
+        // (Remote sends never reach here - send_remote errors at Layer <6.)
+        if node == 0 { crate::process::wake_blocked(); }
         Ok(0)
     })();
 
@@ -248,8 +251,22 @@ pub fn sys_send(frame: &mut TrapFrame) {
     };
 }
 
-/// SYS_RECV(a0=dst_va, a1=max_len) -> bytes_received | err
-pub fn sys_recv(frame: &mut TrapFrame) {
+/// SYS_RECV(a0=dst_va, a1=max_len) -> bytes_received | err.
+/// Returns `true` if the caller BLOCKED: the queue was empty, the frame now
+/// holds the NEXT process, and the dispatch arm must early-return (no +4, no
+/// regs writes). The blocked process's saved sepc points AT its ecall, so it
+/// re-executes the whole syscall on wake and finds the message (restart
+/// semantics - the wake path never needs to touch user memory).
+pub fn sys_recv(frame: &mut TrapFrame) -> bool {
+    // Blocking check BEFORE any other work or any write to `frame`.
+    unsafe {
+        let ep = &raw const ENDPOINT;
+        if (*ep).count == 0 {
+            crate::kprintln!("[IPC] RECV: queue empty - blocking caller");
+            crate::process::block_current(frame);
+            return true; // frame = the NEXT process now. Touch NOTHING.
+        }
+    }
     let dst_va  = frame.regs[9];
     let max_len = frame.regs[10];
 
@@ -270,6 +287,7 @@ pub fn sys_recv(frame: &mut TrapFrame) {
 
     frame.regs[9] = match ret {
         Ok(n)  => { crate::kprintln!("[IPC] RECV ok: {} bytes delivered to user", n); n }
-        Err(e) => { crate::kprintln!("[IPC] RECV failed (queue empty or bad msg)"); e.as_ret() }
+        Err(e) => { crate::kprintln!("[IPC] RECV failed (bad msg)"); e.as_ret() }
     };
+    false // completed (ok or error) - normal +4 path applies
 }

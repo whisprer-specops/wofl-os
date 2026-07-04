@@ -47,6 +47,19 @@ pub fn init() {
     crate::kprintln!("[TRAP] trap vector installed + trusted kernel trap stack armed");
 }
 
+/// Arm the preemption timer: sie.STIE on + first deadline programmed.
+/// sstatus.SIE deliberately stays 0 FOREVER: S-interrupts are masked by SIE
+/// only while IN S-mode, and always deliverable from U-mode. So user code is
+/// preemptible but the kernel never is - which is precisely what keeps the
+/// static mut ENDPOINT/TABLE sound without locks (kernel critical sections
+/// cannot be interrupted). Locks come with SMP, not before.
+pub fn enable_timer() {
+    unsafe { asm!("csrs sie, {b}", b = in(reg) 1usize << 5); } // STIE
+    crate::sbi::set_timer(crate::sbi::read_time() + crate::sbi::TIMER_INTERVAL);
+    crate::kprintln!("[TRAP] preemption timer armed ({} ticks/quantum, SBI set_timer rearm)",
+        crate::sbi::TIMER_INTERVAL);
+}
+
 pub fn create_test_user_context(entry: usize, stack: usize) -> TrapFrame {
     let mut frame = TrapFrame::zero();
     frame.sepc = entry;
@@ -126,9 +139,23 @@ pub extern "C" fn trap_handler(frame: &mut TrapFrame) {
     else { handle_exception(code, stval, frame); }
 }
 
-fn handle_interrupt(code: usize, _frame: &mut TrapFrame) {
-    crate::kprintln!("[TRAP] interrupt {} (unexpected, ints off) - halting", code);
-    loop { unsafe { asm!("wfi"); } }
+fn handle_interrupt(code: usize, frame: &mut TrapFrame) {
+    match code {
+        5 => { // supervisor timer interrupt
+            // Rearm FIRST via SBI set_timer - this clears pending STIP (the
+            // fix for the legendary storm: the old bare-SIE arm never cleared
+            // it, so the same interrupt re-fired every sret forever).
+            crate::sbi::set_timer(crate::sbi::read_time() + crate::sbi::TIMER_INTERVAL);
+            // Preempt. NO sepc adjustment anywhere on this path: an interrupt
+            // resumes AT the interrupted instruction. A +4 here would skip a
+            // random user instruction - corruption that differs every boot.
+            crate::process::preempt(frame);
+        }
+        _ => {
+            crate::kprintln!("[TRAP] unexpected interrupt {} - halting", code);
+            loop { unsafe { asm!("wfi"); } }
+        }
+    }
 }
 
 fn handle_exception(code: usize, stval: usize, frame: &mut TrapFrame) {
@@ -154,19 +181,20 @@ fn handle_syscall(frame: &mut TrapFrame) {
         }
         SYS_EXIT => {
             let code = frame.regs[9]; // a0
-            crate::kprintln!("[SYSCALL] User process exit (code: {})", code);
-            crate::kprintln!("");
-            crate::kprintln!("*** woflOS: user isolated in its own pages, ran, exited cleanly ***");
-            crate::kprintln!("Layer 2 (memory protection) HARDENED - trap runs on trusted stack, SUM off.");
-            crate::kprintln!("Ready for Layer 3 (IPC & capabilities).");
-            loop { unsafe { asm!("wfi"); } }
+            crate::process::exit_current(frame, code);
+            return; // frame now holds the NEXT process (or we never got here);
+                    // the shared +4 below must not touch it
         }
         SYS_YIELD => {
             crate::process::yield_to_next(frame);
             return; // yield handles sepc itself - MUST skip the shared +4 below
         }
         SYS_SEND => { crate::ipc::sys_send(frame); }
-        SYS_RECV => { crate::ipc::sys_recv(frame); }
+        SYS_RECV => {
+            if crate::ipc::sys_recv(frame) {
+                return; // caller BLOCKED: frame = next process; skip shared +4
+            }
+        }
         SYS_SEND_REMOTE | SYS_RECV_REMOTE | SYS_NODE_DISCOVER => {
             crate::kprintln!("[SYSCALL] Distributed op not yet implemented (Layer 6)");
             frame.regs[9] = usize::MAX;
