@@ -1,4 +1,4 @@
-// src/trap.rs - Layer 1 Context Switching Foundation
+// src/trap.rs - Layer 1 context switching + Layer 2 trusted-trap-stack hardening
 
 use core::arch::asm;
 use crate::syscall::*;
@@ -14,15 +14,36 @@ impl TrapFrame {
     pub const fn zero() -> Self { Self { regs: [0; 31], sepc: 0, sstatus: 0 } }
 }
 
+// ---- Dedicated kernel trap stack ----
+// The handler runs HERE, never on the user's stack. sscratch holds this top
+// while we're in U-mode; the vector swaps it into sp on trap entry. Separate
+// from the boot stack so a trap never resets sp into the middle of the kernel's
+// own live call chain. 16 KiB is ample for the 264-byte frame + kprintln depth.
+const TRAP_STACK_SIZE: usize = 16 * 1024;
+
+#[repr(C, align(16))]
+struct TrapStack([u8; TRAP_STACK_SIZE]);
+
+static mut KERNEL_TRAP_STACK: TrapStack = TrapStack([0; TRAP_STACK_SIZE]);
+
+#[inline]
+fn trap_stack_top() -> usize {
+    let base = &raw const KERNEL_TRAP_STACK as *const u8 as usize;
+    base + TRAP_STACK_SIZE
+}
+
 pub fn init() {
     unsafe {
         extern "C" { fn _trap_vector(); }
-        asm!("csrw stvec, {h}", h = in(reg) _trap_vector as usize);
-        // Interrupts stay OFF for the Layer 1 syscall test. The old
-        // `csrsi sstatus, 0x2` armed SIE while the timer ISR never rearmed
-        // STIP -> guaranteed storm. Interrupts return in Layer 4 (scheduler).
+        asm!("csrw stvec, {h}", h = in(reg) _trap_vector as *const () as usize);
+        // S-mode convention: sscratch == 0 means "currently executing in S-mode".
+        // Set explicitly because OpenSBI does not guarantee its reset value; a
+        // kernel-origin fault before the first user entry must take the S-path.
+        asm!("csrw sscratch, x0");
+        // Interrupts stay OFF for now (return in Layer 4 with a proper timer
+        // rearm). The old `csrsi sstatus,0x2` armed SIE with no STIP rearm -> storm.
     }
-    crate::kprintln!("[TRAP] Layer 1 initialized - context switching ready");
+    crate::kprintln!("[TRAP] trap vector installed + trusted kernel trap stack armed");
 }
 
 pub fn create_test_user_context(entry: usize, stack: usize) -> TrapFrame {
@@ -33,8 +54,15 @@ pub fn create_test_user_context(entry: usize, stack: usize) -> TrapFrame {
 }
 
 pub fn enter_user_mode(frame: &TrapFrame) -> ! {
-    // Derive user sstatus from the live one (keep FS/SUM/etc); only set
-    // SPP=0 (return to U-mode) and SPIE=0 (interrupts off after sret).
+    // Park the trusted trap stack top in sscratch BEFORE we drop to U-mode, so
+    // the very first user trap already lands on kernel memory. Every subsequent
+    // U-return re-arms sscratch from inside the vector, keeping this invariant.
+    unsafe { asm!("csrw sscratch, {t}", t = in(reg) trap_stack_top()); }
+
+    // Derive user sstatus from the live one (keep FS etc); set SPP=0 (return to
+    // U) and SPIE=0 (ints off after sret). We deliberately DO NOT set SUM: with
+    // the trap-stack switch the handler never touches user pages, so S-mode has
+    // no business reaching into U memory. That closes the trust hole entirely.
     let mut sstatus: usize;
     unsafe { asm!("csrr {s}, sstatus", s = out(reg) sstatus); }
     sstatus &= !(1usize << 8); // SPP  = 0
@@ -98,7 +126,7 @@ pub extern "C" fn trap_handler(frame: &mut TrapFrame) {
 }
 
 fn handle_interrupt(code: usize, _frame: &mut TrapFrame) {
-    crate::kprintln!("[TRAP] interrupt {} (unexpected in Layer 1) - halting", code);
+    crate::kprintln!("[TRAP] interrupt {} (unexpected, ints off) - halting", code);
     loop { unsafe { asm!("wfi"); } }
 }
 
@@ -121,14 +149,15 @@ fn handle_syscall(frame: &mut TrapFrame) {
     match n {
         SYS_TEST => {
             crate::kprintln!("[SYSCALL] Test syscall from user mode - SUCCESS!");
-            frame.regs[9] = 42;
+            frame.regs[9] = 42; // a0
         }
         SYS_EXIT => {
-            let code = frame.regs[9];
+            let code = frame.regs[9]; // a0
             crate::kprintln!("[SYSCALL] User process exit (code: {})", code);
             crate::kprintln!("");
-            crate::kprintln!("*** Layer 1 Context Switching: OPERATIONAL ***");
-            crate::kprintln!("Ready to proceed to Layer 2!");
+            crate::kprintln!("*** woflOS: user isolated in its own pages, ran, exited cleanly ***");
+            crate::kprintln!("Layer 2 (memory protection) HARDENED - trap runs on trusted stack, SUM off.");
+            crate::kprintln!("Ready for Layer 3 (IPC & capabilities).");
             loop { unsafe { asm!("wfi"); } }
         }
         SYS_SEND | SYS_RECV => {
@@ -147,16 +176,28 @@ fn handle_syscall(frame: &mut TrapFrame) {
     frame.sepc += 4;
 }
 
+// ---- Trap vector: trusted-stack switch on entry, mode-aware restore on exit ----
 core::arch::global_asm!(
     r#"
 .section .text
 .align 4
 .global _trap_vector
 _trap_vector:
+    # --- switch onto a trusted kernel stack ---
+    # Invariant: sscratch = kernel trap-stack top when in U-mode, 0 when in S-mode.
+    csrrw sp, sscratch, sp      # atomic swap sp <-> sscratch
+    bnez  sp, 1f                # sp != 0 -> from U-mode (sscratch held kstack top)
+    csrrw sp, sscratch, sp      # from S-mode: sp was 0; undo -> sp=kern sp, sscratch=0
+1:
     addi sp, sp, -264
-    sd t0, 32(sp)
-    addi t0, sp, 264
-    sd t0, 8(sp)
+    sd   t0, 32(sp)             # stash t0 (x5) so we can use it as scratch
+    csrr t0, sscratch           # U-origin: user sp ; S-origin: 0
+    bnez t0, 2f
+    addi t0, sp, 264            # S-origin: trapped sp = kstack top = sp + 264
+2:
+    sd   t0, 8(sp)              # regs[1] = trapped sp (x2), correct for either origin
+    csrw sscratch, x0           # mark "in S-mode" while we handle (nested S-fault safe)
+
     sd ra, 0(sp)
     sd gp, 16(sp)
     sd tp, 24(sp)
@@ -190,10 +231,18 @@ _trap_vector:
     sd t0, 248(sp)
     csrr t0, sstatus
     sd t0, 256(sp)
+
     mv a0, sp
     call trap_handler
+
+    # --- restore ---
     ld t0, 256(sp)
-    csrw sstatus, t0
+    csrw sstatus, t0            # t0 = the sstatus we return with; SPP = bit 8
+    andi t1, t0, 0x100          # t1 = SPP
+    bnez t1, 3f                 # SPP=1 -> returning to S-mode, leave sscratch = 0
+    addi t1, sp, 264           # returning to U-mode: re-arm sscratch = trap-stack top
+    csrw sscratch, t1
+3:
     ld t0, 248(sp)
     csrw sepc, t0
     ld ra, 0(sp)
@@ -226,7 +275,7 @@ _trap_vector:
     ld t4, 224(sp)
     ld t5, 232(sp)
     ld t6, 240(sp)
-    addi sp, sp, 264
+    ld sp, 8(sp)               # restore trapped sp LAST (user sp for U-return)
     sret
     "#
 );
