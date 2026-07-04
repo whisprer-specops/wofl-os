@@ -1,5 +1,6 @@
 pub mod frame;
 pub mod heap;
+pub mod paging;
 
 /// Page size for RISC-V (4KB)
 pub const PAGE_SIZE: usize = 4096;
