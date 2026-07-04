@@ -1,99 +1,71 @@
-//! Layer 3 — IPC & capabilities (the distributed keystone).
+//! Layer 3/5 — IPC & capabilities, now with FIRST-CLASS ENDPOINTS.
 //!
-//! Distributed-native from day one. Two shapes carry the whole thesis:
-//!   * `Capability` has `node_id` (0 = local, >0 = remote) so a remote cap is
-//!     later just "same struct, node_id>0, HMAC over these bytes" — no refactor.
-//!   * `IPCMessage` is fixed-size and pointer-free, so the SAME copy code moves
-//!     it between address spaces today and across a wire at Layer 6.
-//!
-//! Routing branches on `dst_cap.node_id`: 0 -> `send_local`, >0 -> `send_remote`
-//! (a present-but-halting stub L6 fills in). The branch existing NOW is what
-//! makes L6 a fill-in rather than a rewrite.
-//!
-//! uaccess note: SUM is OFF (zero-trust). The kernel reaches user bytes via the
-//! DRAM identity map after `paging::translate()` both (a) resolves the VA->PA
-//! and (b) proves every page carries the U bit — so the kernel only ever touches
-//! memory the user itself owns. A user pointer into kernel space fails the U
-//! check and is rejected, never dereferenced.
+//! Messages are ADDRESSED: `dst_cap.node_id` routes to a node (0 local, >0
+//! remote), `dst_cap.service_id` selects one of N per-node endpoint queues.
+//! The sender's reply address rides in `src_cap.service_id` (a local endpoint
+//! it owns); the receiver reads it to answer the right client. This kills the
+//! shared-FIFO self-delivery problem and enables multi-client services - and it
+//! is EXACTLY the addressing Layer 6 needs for remote replies, one layer early.
 
 use crate::memory::paging::{self, PTE_U, PTE_R, PTE_W};
 use crate::memory::PAGE_SIZE;
 use crate::trap::TrapFrame;
 
-/// Max inline payload. Design doc says 4096; 256 keeps the static queue small
-/// and avoids 4 KiB by-value copies for bring-up. Single knob — bump freely;
-/// the serialization property does not depend on N.
 pub const IPC_PAYLOAD_MAX: usize = 256;
-
-/// Endpoint queue depth (fixed — no heap, no pointers).
 const ENDPOINT_DEPTH: usize = 4;
 
-// Capability permission bits.
+/// Number of per-node endpoint queues. Well-known ids for bring-up:
+///   0 = null/reserved, 1 = VFS service, 2/3 = client reply endpoints,
+///   4 = echo service. DEBT: userspace currently PICKS its own ids (no cap
+///   enforcement) - Layer 7 makes holding the endpoint cap the authority.
+pub const N_ENDPOINTS: usize = 8;
+
 pub const CAP_SEND: u32 = 1 << 0;
 pub const CAP_RECV: u32 = 1 << 1;
-
-// Message types (room for control/data/etc later).
 pub const MSG_DATA: u32 = 1;
 
-/// Well-known local service id for the bring-up endpoint.
-const SERVICE_ECHO: u32 = 1;
-
-/// Unforgeable authority token. `#[repr(C)]`, fixed-size, no pointers ->
-/// serializable as-is. Locally the kernel is sole minter (no crypto yet);
-/// `nonce`/`expiry` exist now so L6 can HMAC the exact byte layout unchanged.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Capability {
-    pub node_id: u32,     // 0 = this node; >0 = remote (routing key)
-    pub service_id: u32,  // which service/endpoint
-    pub object_id: u64,   // object within the service
-    pub permissions: u32, // CAP_SEND | CAP_RECV | ...
-    pub _pad: u32,        // explicit pad -> deterministic layout across nodes
-    pub nonce: u64,       // anti-replay (cosmetic locally; enforced at L6)
-    pub expiry: u64,      // 0 = never; tick-based expiry later
+    pub node_id: u32,
+    pub service_id: u32,
+    pub object_id: u64,
+    pub permissions: u32,
+    pub _pad: u32,
+    pub nonce: u64,
+    pub expiry: u64,
 }
-
 impl Capability {
     pub const fn zero() -> Self {
-        Self { node_id: 0, service_id: 0, object_id: 0,
-               permissions: 0, _pad: 0, nonce: 0, expiry: 0 }
+        Self { node_id:0, service_id:0, object_id:0, permissions:0, _pad:0, nonce:0, expiry:0 }
     }
-    /// Mint a local endpoint cap (kernel is the authority).
-    pub const fn local_endpoint(perms: u32) -> Self {
-        Self { node_id: 0, service_id: SERVICE_ECHO, object_id: 0,
-               permissions: perms, _pad: 0, nonce: 0, expiry: 0 }
+    /// Address a (node, endpoint) with permissions. The load-bearing constructor.
+    pub const fn endpoint(node_id: u32, service_id: u32, perms: u32) -> Self {
+        Self { node_id, service_id, object_id:0, permissions:perms, _pad:0, nonce:0, expiry:0 }
     }
 }
 
-/// Fixed-size, pointer-free, serializable message. The load-bearing shape.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct IPCMessage {
     pub version: u32,
     pub msg_type: u32,
-    pub src_cap: Capability,
-    pub dst_cap: Capability,
+    pub src_cap: Capability,   // sender's REPLY endpoint (the return address)
+    pub dst_cap: Capability,   // destination (node, endpoint)
     pub payload_len: u32,
     pub _pad: u32,
     pub payload: [u8; IPC_PAYLOAD_MAX],
     pub checksum: u64,
 }
-
 impl IPCMessage {
     pub const fn zero() -> Self {
-        Self {
-            version: 1, msg_type: 0,
-            src_cap: Capability::zero(), dst_cap: Capability::zero(),
-            payload_len: 0, _pad: 0,
-            payload: [0u8; IPC_PAYLOAD_MAX], checksum: 0,
-        }
+        Self { version:1, msg_type:0, src_cap:Capability::zero(), dst_cap:Capability::zero(),
+               payload_len:0, _pad:0, payload:[0u8; IPC_PAYLOAD_MAX], checksum:0 }
     }
 }
 
-/// Integrity check over the fields that matter. NOT crypto — corruption
-/// detection only; L6 replaces this with an HMAC over the on-wire bytes.
 fn compute_checksum(msg: &IPCMessage) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a basis
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut fold = |b: u8| { h ^= b as u64; h = h.wrapping_mul(0x1_0000_0001_b3); };
     for b in msg.msg_type.to_le_bytes()    { fold(b); }
     for b in msg.payload_len.to_le_bytes() { fold(b); }
@@ -104,27 +76,23 @@ fn compute_checksum(msg: &IPCMessage) -> u64 {
 
 #[derive(Clone, Copy)]
 pub enum IpcError {
-    Unmapped, NotUser, BadLength, NoPermission, QueueFull, QueueEmpty, RemoteUnreachable,
+    Unmapped, NotUser, BadLength, NoPermission, QueueFull, QueueEmpty, RemoteUnreachable, BadEndpoint,
 }
 impl IpcError {
-    /// Encode as the syscall's usize return (high-bit-set = error).
     fn as_ret(self) -> usize {
         let code = match self {
-            IpcError::Unmapped => 1, IpcError::NotUser => 2, IpcError::BadLength => 3,
-            IpcError::NoPermission => 4, IpcError::QueueFull => 5, IpcError::QueueEmpty => 6,
-            IpcError::RemoteUnreachable => 7,
+            IpcError::Unmapped=>1, IpcError::NotUser=>2, IpcError::BadLength=>3,
+            IpcError::NoPermission=>4, IpcError::QueueFull=>5, IpcError::QueueEmpty=>6,
+            IpcError::RemoteUnreachable=>7, IpcError::BadEndpoint=>8,
         };
-        usize::MAX - code + 1 // -code as usize
+        usize::MAX - code + 1
     }
 }
 
-// ---- uaccess: touch user memory only after validating U ownership ----
-
-/// Copy `len` bytes FROM a user VA into a kernel buffer, via the identity map.
-/// Rejects any page lacking U|R. SUM stays off throughout.
+// ---- uaccess (unchanged: validate U ownership; SUM stays off) ----
 unsafe fn copy_from_user(dst: &mut [u8], user_va: usize, len: usize) -> Result<(), IpcError> {
     if len > dst.len() { return Err(IpcError::BadLength); }
-    let root = paging::current_root(); // running process address space (satp), not kernel
+    let root = paging::current_root();
     let mut done = 0;
     while done < len {
         let va = user_va + done;
@@ -137,12 +105,9 @@ unsafe fn copy_from_user(dst: &mut [u8], user_va: usize, len: usize) -> Result<(
     }
     Ok(())
 }
-
-/// Copy `len` bytes TO a user VA from a kernel buffer, via the identity map.
-/// Rejects any page lacking U|W. SUM stays off throughout.
 unsafe fn copy_to_user(user_va: usize, src: &[u8], len: usize) -> Result<(), IpcError> {
     if len > src.len() { return Err(IpcError::BadLength); }
-    let root = paging::current_root(); // running process address space (satp), not kernel
+    let root = paging::current_root();
     let mut done = 0;
     while done < len {
         let va = user_va + done;
@@ -156,47 +121,53 @@ unsafe fn copy_to_user(user_va: usize, src: &[u8], len: usize) -> Result<(), Ipc
     Ok(())
 }
 
-// ---- Endpoint: a fixed, pointer-free ring of messages ----
-
+// ---- Endpoint table: N fixed, pointer-free rings ----
 struct Endpoint {
     msgs: [IPCMessage; ENDPOINT_DEPTH],
-    head: usize, // dequeue here
-    tail: usize, // enqueue here
-    count: usize,
+    head: usize, tail: usize, count: usize,
+}
+impl Endpoint {
+    const fn new() -> Self {
+        Self { msgs: [const { IPCMessage::zero() }; ENDPOINT_DEPTH], head:0, tail:0, count:0 }
+    }
+}
+static mut ENDPOINTS: [Endpoint; N_ENDPOINTS] = [const { Endpoint::new() }; N_ENDPOINTS];
+// Single-hart, interrupts off -> plain static mut is safe (kernel critical
+// sections are non-preemptible). Needs a per-endpoint lock at SMP.
+
+/// True if endpoint `ep` currently holds no messages. OOB -> treated non-empty
+/// so the caller's bounds check (not a block) handles the error path.
+pub fn endpoint_empty(ep: usize) -> bool {
+    if ep >= N_ENDPOINTS { return false; }
+    unsafe { (*(&raw const ENDPOINTS))[ep].count == 0 }
 }
 
-static mut ENDPOINT: Endpoint = Endpoint {
-    msgs: [const { IPCMessage::zero() }; ENDPOINT_DEPTH],
-    head: 0, tail: 0, count: 0,
-};
-// Single-hart, interrupts off -> plain static mut is safe for step A. When L4
-// adds preemption/SMP this needs a proper lock; flagged, not forgotten.
-
-fn send_local(msg: &IPCMessage) -> Result<(), IpcError> {
+fn send_local(ep: usize, msg: &IPCMessage) -> Result<(), IpcError> {
+    if ep >= N_ENDPOINTS { return Err(IpcError::BadEndpoint); }
     unsafe {
-        let ep = &raw mut ENDPOINT;
-        if (*ep).count == ENDPOINT_DEPTH { return Err(IpcError::QueueFull); }
-        let t = (*ep).tail;
-        (*ep).msgs[t] = *msg;
-        (*ep).tail = (t + 1) % ENDPOINT_DEPTH;
-        (*ep).count += 1;
+        let e = &mut (*(&raw mut ENDPOINTS))[ep];
+        if e.count == ENDPOINT_DEPTH { return Err(IpcError::QueueFull); }
+        let t = e.tail;
+        e.msgs[t] = *msg;
+        e.tail = (t + 1) % ENDPOINT_DEPTH;
+        e.count += 1;
     }
     Ok(())
 }
 
-fn recv_local(out: &mut IPCMessage) -> Result<(), IpcError> {
+fn recv_local(ep: usize, out: &mut IPCMessage) -> Result<(), IpcError> {
+    if ep >= N_ENDPOINTS { return Err(IpcError::BadEndpoint); }
     unsafe {
-        let ep = &raw mut ENDPOINT;
-        if (*ep).count == 0 { return Err(IpcError::QueueEmpty); }
-        let h = (*ep).head;
-        *out = (*ep).msgs[h];
-        (*ep).head = (h + 1) % ENDPOINT_DEPTH;
-        (*ep).count -= 1;
+        let e = &mut (*(&raw mut ENDPOINTS))[ep];
+        if e.count == 0 { return Err(IpcError::QueueEmpty); }
+        let h = e.head;
+        *out = e.msgs[h];
+        e.head = (h + 1) % ENDPOINT_DEPTH;
+        e.count -= 1;
     }
     Ok(())
 }
 
-/// The distributed routing decision — present from day one.
 fn send_remote(node_id: u32, _msg: &IPCMessage) -> Result<(), IpcError> {
     crate::kprintln!("[IPC] send_remote: node {} unreachable - networking is Layer 6", node_id);
     Err(IpcError::RemoteUnreachable)
@@ -204,90 +175,88 @@ fn send_remote(node_id: u32, _msg: &IPCMessage) -> Result<(), IpcError> {
 
 fn route_send(msg: &IPCMessage) -> Result<(), IpcError> {
     if msg.dst_cap.node_id == 0 {
-        send_local(msg)
+        send_local(msg.dst_cap.service_id as usize, msg)
     } else {
         send_remote(msg.dst_cap.node_id, msg)
     }
 }
 
-// ---- Syscall handlers (wired from trap::handle_syscall) ----
-// ABI: a0=x10=regs[9], a1=x11=regs[10], a2=x12=regs[11]. Return in a0=regs[9].
-// These set ONLY regs[9]; the outer handle_syscall advances sepc once.
+// ---- Syscall handlers ----
+// ABI: a0=regs[9], a1=regs[10], a2=regs[11], a3=regs[12], a4=regs[13].
 
-/// SYS_SEND(a0=payload_va, a1=payload_len, a2=dst_node_id) -> 0 ok | err
+/// SYS_SEND(a0=buf, a1=len, a2=dst_node, a3=dst_endpoint, a4=reply_endpoint) -> 0|err
 pub fn sys_send(frame: &mut TrapFrame) {
     let buf_va = frame.regs[9];
     let len    = frame.regs[10];
     let node   = frame.regs[11] as u32;
+    let dst_ep = frame.regs[12] as u32;
+    let rep_ep = frame.regs[13] as u32;
 
     let ret = (|| -> Result<usize, IpcError> {
         if len > IPC_PAYLOAD_MAX { return Err(IpcError::BadLength); }
-
         let mut msg = IPCMessage::zero();
         msg.version  = 1;
         msg.msg_type = MSG_DATA;
-        msg.src_cap  = Capability::local_endpoint(CAP_SEND);
-        msg.dst_cap  = Capability::local_endpoint(CAP_SEND | CAP_RECV);
-        msg.dst_cap.node_id = node; // routing key: 0 local, >0 remote
+        msg.src_cap  = Capability::endpoint(0, rep_ep, CAP_SEND | CAP_RECV); // return address
+        msg.dst_cap  = Capability::endpoint(node, dst_ep, CAP_SEND | CAP_RECV);
         msg.payload_len = len as u32;
-
-        // Capability check: sender must hold SEND on the destination.
         if msg.dst_cap.permissions & CAP_SEND == 0 { return Err(IpcError::NoPermission); }
-
-        // Pull the payload from validated user memory (U-owned pages only).
         unsafe { copy_from_user(&mut msg.payload, buf_va, len)?; }
         msg.checksum = compute_checksum(&msg);
-
         route_send(&msg)?;
-        // Message queued locally: wake any receivers blocked on the endpoint.
-        // (Remote sends never reach here - send_remote errors at Layer <6.)
-        if node == 0 { crate::process::wake_blocked(); }
+        // Local delivery: wake anyone blocked on the DESTINATION endpoint.
+        if node == 0 { crate::process::wake_endpoint(dst_ep as usize); }
         Ok(0)
     })();
 
     frame.regs[9] = match ret {
-        Ok(v)  => { crate::kprintln!("[IPC] SEND ok: {} bytes -> node {} (queued)", len, node); v }
-        Err(e) => { crate::kprintln!("[IPC] SEND failed"); e.as_ret() }
+        Ok(v)  => { crate::kprintln!("[IPC] SEND ok: {} bytes -> node {} ep {} (reply ep {})",
+                        len, node, dst_ep, rep_ep); v }
+        Err(_) => { crate::kprintln!("[IPC] SEND failed (node {} ep {})", node, dst_ep);
+                    IpcError::RemoteUnreachable.as_ret() }
     };
 }
 
-/// SYS_RECV(a0=dst_va, a1=max_len) -> bytes_received | err.
-/// Returns `true` if the caller BLOCKED: the queue was empty, the frame now
-/// holds the NEXT process, and the dispatch arm must early-return (no +4, no
-/// regs writes). The blocked process's saved sepc points AT its ecall, so it
-/// re-executes the whole syscall on wake and finds the message (restart
-/// semantics - the wake path never needs to touch user memory).
+/// SYS_RECV(a0=buf, a1=maxlen, a2=endpoint) -> a0=bytes, a1=src_reply_endpoint | err.
+/// Returns true if the caller BLOCKED (frame now holds the NEXT process).
 pub fn sys_recv(frame: &mut TrapFrame) -> bool {
-    // Blocking check BEFORE any other work or any write to `frame`.
-    unsafe {
-        let ep = &raw const ENDPOINT;
-        if (*ep).count == 0 {
-            crate::kprintln!("[IPC] RECV: queue empty - blocking caller");
-            crate::process::block_current(frame);
-            return true; // frame = the NEXT process now. Touch NOTHING.
-        }
+    let my_ep = frame.regs[11] as usize; // a2
+
+    if my_ep >= N_ENDPOINTS {
+        frame.regs[9] = IpcError::BadEndpoint.as_ret();
+        return false;
     }
+    // Block BEFORE touching frame result regs (block swaps in the next process).
+    if endpoint_empty(my_ep) {
+        crate::kprintln!("[IPC] RECV: endpoint {} empty - blocking caller", my_ep);
+        crate::process::block_current(frame, my_ep);
+        return true; // frame = NEXT process now. Touch NOTHING.
+    }
+
     let dst_va  = frame.regs[9];
     let max_len = frame.regs[10];
-
+    let mut src_ep: usize = 0;
     let ret = (|| -> Result<usize, IpcError> {
         let mut msg = IPCMessage::zero();
-        recv_local(&mut msg)?;
-
-        // Receiver must hold RECV on the endpoint.
+        recv_local(my_ep, &mut msg)?;
         if msg.dst_cap.permissions & CAP_RECV == 0 { return Err(IpcError::NoPermission); }
-
-        // Integrity check before handing bytes back.
         if compute_checksum(&msg) != msg.checksum { return Err(IpcError::BadLength); }
-
+        src_ep = msg.src_cap.service_id as usize; // sender's reply endpoint
         let n = core::cmp::min(msg.payload_len as usize, max_len).min(IPC_PAYLOAD_MAX);
         unsafe { copy_to_user(dst_va, &msg.payload, n)?; }
         Ok(n)
     })();
 
-    frame.regs[9] = match ret {
-        Ok(n)  => { crate::kprintln!("[IPC] RECV ok: {} bytes delivered to user", n); n }
-        Err(e) => { crate::kprintln!("[IPC] RECV failed (bad msg)"); e.as_ret() }
-    };
-    false // completed (ok or error) - normal +4 path applies
+    match ret {
+        Ok(n) => {
+            crate::kprintln!("[IPC] RECV ok: {} bytes on ep {} (from ep {})", n, my_ep, src_ep);
+            frame.regs[9]  = n;      // a0 = bytes
+            frame.regs[10] = src_ep; // a1 = source reply endpoint
+        }
+        Err(e) => {
+            crate::kprintln!("[IPC] RECV failed on ep {}", my_ep);
+            frame.regs[9] = e.as_ret();
+        }
+    }
+    false
 }

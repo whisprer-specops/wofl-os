@@ -1,0 +1,23 @@
+[package]
+name = "wofl-user"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[[bin]]
+name = "vfs"
+path = "src/vfs.rs"
+
+[[bin]]
+name = "client"
+path = "src/client.rs"
+
+[[bin]]
+name = "client_b"
+path = "src/client_b.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true

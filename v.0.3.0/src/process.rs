@@ -28,7 +28,24 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 pub const USER_CODE_VA:  usize = 0x0040_0000; // 4 MiB
 pub const USER_STACK_VA: usize = 0x0080_0000; // 8 MiB
 
-pub const MAX_PROCS: usize = 2;
+/// A loadable userspace program: a flat blob (objcopy output) plus the page-
+/// aligned section layout extracted from the linker script by build.sh. Every
+/// program links at USER_CODE_VA; per-process roots keep same-VA regions in
+/// DIFFERENT physical frames, so programs never collide despite shared VAs.
+pub struct UserImage {
+    pub blob: &'static [u8],
+    pub text_va: usize,   pub text_len: usize,
+    pub rodata_va: usize, pub rodata_len: usize,
+    pub data_va: usize,   pub data_len: usize,
+    pub bss_va: usize,    pub bss_len: usize,
+    pub entry: usize,
+}
+
+// Compile-time contract: the loader computes blob offsets as (VA-USER_CODE_VA),
+// so the linker's USER_BASE MUST equal USER_CODE_VA. Caught at BUILD, not boot.
+const _: () = assert!(USER_CODE_VA == crate::user_layout::USER_BASE);
+
+pub const MAX_PROCS: usize = 4;
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -44,35 +61,67 @@ pub struct Process {
     pub root: usize,      // Sv39 root PA for satp
     pub state: ProcessState,
     pub home_node: u32,   // distributed: owning node (0 = this node)
+    pub blocked_ep: usize,// which endpoint this process is Blocked waiting on
 }
 
 static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
 
-static mut TABLE: [Option<Process>; MAX_PROCS] = [None, None];
+static mut TABLE: [Option<Process>; MAX_PROCS] = [None, None, None, None];
 static mut CURRENT: usize = 0;
 
 /// Total involuntary (timer) context switches - the preemption proof metric.
 static TICK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Map a file-backed region: copy blob bytes into fresh U-pages with `flags`.
+/// blob offset = va - USER_CODE_VA (the validated flat-binary contract). `len`
+/// is a page-multiple; len==0 maps nothing (empty section).
+unsafe fn map_file_region(root: usize, img: &UserImage, va: usize, len: usize, flags: usize) {
+    let mut off = 0;
+    while off < len {
+        let pa = alloc_frame().expect("process: OOM region frame");
+        let file_off = (va - USER_CODE_VA) + off;
+        core::ptr::copy_nonoverlapping(
+            img.blob.as_ptr().add(file_off), pa as *mut u8, PAGE_SIZE);
+        paging::map_4k(root, va + off, pa, PTE_U | flags | PTE_A);
+        off += PAGE_SIZE;
+    }
+}
+
+/// Map a zero-filled region (.bss): fresh zeroed U-pages, no blob source.
+unsafe fn map_zero_region(root: usize, va: usize, len: usize, flags: usize) {
+    let mut off = 0;
+    while off < len {
+        let pa = alloc_frame().expect("process: OOM bss frame");
+        core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE);
+        paging::map_4k(root, va + off, pa, PTE_U | flags | PTE_A);
+        off += PAGE_SIZE;
+    }
+}
+
 impl Process {
     /// Create a user process in its own address space from a position-
     /// independent code image `[code_src, code_src+code_len)` in kernel .text.
-    pub unsafe fn new_user(code_src: usize, code_len: usize) -> Self {
+    pub unsafe fn new_user(img: &UserImage) -> Self {
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
 
         let root = paging::create_root();
 
-        let code_pa = alloc_frame().expect("process: OOM code frame");
-        core::ptr::copy_nonoverlapping(code_src as *const u8, code_pa as *mut u8, code_len);
-        asm!("fence.i", options(nostack));
-        paging::map_4k(root, USER_CODE_VA, code_pa, PTE_U | PTE_R | PTE_X | PTE_A);
+        // Per-section W^X mapping. .text R+X, .rodata R, .data/.bss R+W.
+        map_file_region(root, img, img.text_va,   img.text_len,   PTE_R | PTE_X);
+        map_file_region(root, img, img.rodata_va, img.rodata_len, PTE_R);
+        map_file_region(root, img, img.data_va,   img.data_len,   PTE_R | PTE_W | PTE_D);
+        map_zero_region(root, img.bss_va, img.bss_len,            PTE_R | PTE_W | PTE_D);
 
+        // .text was written via the data path - sync the I-stream before it runs.
+        asm!("fence.i", options(nostack));
+
+        // User stack: one zeroed R+W page.
         let stack_pa = alloc_frame().expect("process: OOM stack frame");
         core::ptr::write_bytes(stack_pa as *mut u8, 0, PAGE_SIZE);
         paging::map_4k(root, USER_STACK_VA, stack_pa, PTE_U | PTE_R | PTE_W | PTE_A | PTE_D);
 
         let mut frame = TrapFrame::zero();
-        frame.sepc = USER_CODE_VA;
+        frame.sepc = img.entry;
         frame.regs[1] = USER_STACK_VA + PAGE_SIZE; // x2 / sp
 
         // ⚠️ CRITICAL: the vector's restore does `csrw sstatus` straight from
@@ -85,16 +134,16 @@ impl Process {
         frame.sstatus = sstatus;
 
         crate::kprintln!(
-            "[L4] process pid={} created: root@{:#x} code_pa={:#x} stack_pa={:#x}",
-            pid, root, code_pa, stack_pa
+            "[L4] process pid={} loaded: root@{:#x} entry={:#x} text={}B rodata={}B data={}B bss={}B",
+            pid, root, img.entry, img.text_len, img.rodata_len, img.data_len, img.bss_len
         );
-        Process { pid, frame, root, state: ProcessState::Ready, home_node: 0 }
+        Process { pid, frame, root, state: ProcessState::Ready, home_node: 0, blocked_ep: 0 }
     }
 }
 
 /// Stage a process into the first free table slot. Returns its pid.
-pub unsafe fn spawn(code_src: usize, code_len: usize) -> usize {
-    let p = Process::new_user(code_src, code_len);
+pub unsafe fn spawn(img: &UserImage) -> usize {
+    let p = Process::new_user(img);
     let pid = p.pid;
     let table = &mut *(&raw mut TABLE);
     for slot in table.iter_mut() {
@@ -196,22 +245,24 @@ pub fn preempt(frame: &mut TrapFrame) {
 ///
 /// ⚠️ CONTRACT: on return, `frame` holds the NEXT process. The caller must
 /// touch NOTHING afterwards - no return value writes, no error encodes.
-pub fn block_current(frame: &mut TrapFrame) {
+pub fn block_current(frame: &mut TrapFrame, ep: usize) {
     unsafe {
         let table = &mut *(&raw mut TABLE);
         let cur = *(&raw const CURRENT);
 
-        // NO frame.sepc += 4 - restart semantics. This is the whole point.
+        // NO frame.sepc += 4 - restart semantics. Record WHICH endpoint we wait
+        // on so wake_endpoint() only revives us when THAT endpoint gets a message.
         let cur_pid = if let Some(p) = table[cur].as_mut() {
             p.frame = *frame;
             p.state = ProcessState::Blocked;
+            p.blocked_ep = ep;
             p.pid
         } else { 0 };
 
         match pick_next_ready(cur) {
             Some(next) => {
-                crate::kprintln!("[L4] block: pid {} -> pid {}",
-                    cur_pid, table[next].as_ref().map(|p| p.pid).unwrap_or(0));
+                crate::kprintln!("[L4] block: pid {} on ep {} -> pid {}",
+                    cur_pid, ep, table[next].as_ref().map(|p| p.pid).unwrap_or(0));
                 switch_into(frame, next);
             }
             None => {
@@ -227,13 +278,13 @@ pub fn block_current(frame: &mut TrapFrame) {
 /// woken receivers RETRY the syscall; one wins the message, others re-block).
 pub fn tick_count() -> usize { TICK_COUNT.load(Ordering::Relaxed) }
 
-pub fn wake_blocked() {
+pub fn wake_endpoint(ep: usize) {
     unsafe {
         let table = &mut *(&raw mut TABLE);
         for slot in table.iter_mut() {
             if let Some(p) = slot.as_mut() {
-                if p.state == ProcessState::Blocked {
-                    crate::kprintln!("[L4] wake: pid {} Ready (message available)", p.pid);
+                if p.state == ProcessState::Blocked && p.blocked_ep == ep {
+                    crate::kprintln!("[L4] wake: pid {} Ready (ep {} has a message)", p.pid, ep);
                     p.state = ProcessState::Ready;
                 }
             }

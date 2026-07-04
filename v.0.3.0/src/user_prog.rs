@@ -1,54 +1,32 @@
-//! Preemption test images: two pure spinners that NEVER yield, block, or do
-//! IPC. Each burns a counted loop then exits a distinct code (11 / 22). The
-//! ONLY way execution can alternate between them is the timer - so every
-//! `[L4] tick: preempt` line is involuntary multitasking, witnessed.
-//! (The blocking-IPC choreography lives on under tag layer4-blocking-recv.)
+//! Embedded compiled-Rust userspace images (Layer 5.1). The VFS service and a
+//! client, each linked at USER_CODE_VA into its own blob. FIRST images with
+//! real .rodata (parser literals / path strings) -> first live exercise of the
+//! loader's rodata region path.
 
-core::arch::global_asm!(r#"
-.section .text
-.align 2
+use crate::process::UserImage;
+use crate::user_layout;
 
-.global user_prog_spin_a_start
-.global user_prog_spin_a_end
-user_prog_spin_a_start:
-    li   t0, 3000000000     # ~600M instructions - spans many 20ms quanta
-1:  addi t0, t0, -1
-    bnez t0, 1b
-    li   a0, 11            # spinner A sentinel
-    li   a7, 1             # SYS_EXIT
-    ecall
-2:  j 2b
-user_prog_spin_a_end:
+static VFS_BLOB:    &[u8] = include_bytes!("vfs.bin");
+static CLIENT_BLOB: &[u8] = include_bytes!("client.bin");
+static CLIENT_B_BLOB: &[u8] = include_bytes!("client_b.bin");
 
-.align 2
-.global user_prog_spin_b_start
-.global user_prog_spin_b_end
-user_prog_spin_b_start:
-    li   t0, 300000000
-1:  addi t0, t0, -1
-    bnez t0, 1b
-    li   a0, 22            # spinner B sentinel
-    li   a7, 1             # SYS_EXIT
-    ecall
-2:  j 2b
-user_prog_spin_b_end:
-"#);
-
-extern "C" {
-    static user_prog_spin_a_start: u8;
-    static user_prog_spin_a_end: u8;
-    static user_prog_spin_b_start: u8;
-    static user_prog_spin_b_end: u8;
+pub fn vfs_image() -> UserImage {
+    use user_layout::vfs::*;
+    UserImage { blob: VFS_BLOB,
+        text_va:TEXT_VA, text_len:TEXT_LEN, rodata_va:RODATA_VA, rodata_len:RODATA_LEN,
+        data_va:DATA_VA, data_len:DATA_LEN, bss_va:BSS_VA, bss_len:BSS_LEN, entry:TEXT_VA }
 }
 
-pub fn image_spin_a() -> (usize, usize) {
-    let s = &raw const user_prog_spin_a_start as *const u8 as usize;
-    let e = &raw const user_prog_spin_a_end   as *const u8 as usize;
-    (s, e - s)
+pub fn client_b_image() -> UserImage {
+    use user_layout::client_b::*;
+    UserImage { blob: CLIENT_B_BLOB,
+        text_va:TEXT_VA, text_len:TEXT_LEN, rodata_va:RODATA_VA, rodata_len:RODATA_LEN,
+        data_va:DATA_VA, data_len:DATA_LEN, bss_va:BSS_VA, bss_len:BSS_LEN, entry:TEXT_VA }
 }
 
-pub fn image_spin_b() -> (usize, usize) {
-    let s = &raw const user_prog_spin_b_start as *const u8 as usize;
-    let e = &raw const user_prog_spin_b_end   as *const u8 as usize;
-    (s, e - s)
+pub fn client_image() -> UserImage {
+    use user_layout::client::*;
+    UserImage { blob: CLIENT_BLOB,
+        text_va:TEXT_VA, text_len:TEXT_LEN, rodata_va:RODATA_VA, rodata_len:RODATA_LEN,
+        data_va:DATA_VA, data_len:DATA_LEN, bss_va:BSS_VA, bss_len:BSS_LEN, entry:TEXT_VA }
 }
