@@ -60,18 +60,34 @@ fn kernel_main_inner() -> ! {
     crate::kprintln!("  \\ \\/\\/ /| (_) | _| | |__| (_) |\\__ \\");
     crate::kprintln!("   \\_/\\_/  \\___/|_|  |____|\\___/ |___/");
     crate::kprintln!("============================================");
-    crate::kprintln!("[OK] woflOS v0.4.0 (Layer 1 bring-up)");
+    crate::kprintln!("[OK] woflOS v0.4.0 (Layer 2 bring-up)");
 
-    // Layer 1: install trap vector + enable minimal trap handling
+    // Layer 1: install the trap vector FIRST. If enabling paging below faults
+    // on a mapping we got wrong, the hardened handler prints ONE diagnostic
+    // line and halts instead of storming. Arm the net before the high-wire act.
     trap::init();
 
-    // Layer 1: enter user mode and prove round-trip syscall works.
-    let user_entry = user_test::user_main as usize;
-    let user_stack_top = user_test::get_user_stack_top();
+    // ---- Layer 2, step 1: enable Sv39 paging (kernel-only address space) ----
+    // No U bit anywhere yet, so the Layer 1 user test is GATED OFF below. This
+    // step proves the satp / sfence.vma / TLB machinery works in isolation:
+    // the kernel keeps running -- printing, using its stack -- but now every
+    // address it touches goes through a page table it walks in hardware.
+    let root = unsafe { memory::paging::init() };
+    crate::kprintln!("[L2] Sv39 paging ENABLED (root PT @ {:#x})", root);
+    crate::kprintln!("[L2] kernel now executing under virtual->physical translation");
 
-    crate::kprintln!("[L1] entering user mode: entry={:#x} stack_top={:#x}", user_entry, user_stack_top);
-    let frame = trap::create_test_user_context(user_entry, user_stack_top);
-    trap::enter_user_mode(&frame)
+    // ---- Layer 1 user test: GATED OFF for step 1 ----
+    // Re-enabled in step 2, once user code + stack get real U-bit page mappings.
+    // let user_entry = user_test::user_main as usize;
+    // let user_stack_top = user_test::get_user_stack_top();
+    // crate::kprintln!("[L1] entering user mode: entry={:#x} stack_top={:#x}", user_entry, user_stack_top);
+    // let frame = trap::create_test_user_context(user_entry, user_stack_top);
+    // trap::enter_user_mode(&frame)
+
+    crate::kprintln!("");
+    crate::kprintln!("*** Layer 2 Step 1: PAGING OPERATIONAL ***");
+    crate::kprintln!("Kernel survived the satp switch. Ready for user mappings.");
+    loop { unsafe { asm!("wfi"); } }
 }
 
 #[panic_handler]
