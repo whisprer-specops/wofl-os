@@ -11,6 +11,7 @@ mod uart;
 mod memory;
 mod syscall;
 mod trap;
+mod ipc;
 mod user_prog;
 
 use uart::Uart;

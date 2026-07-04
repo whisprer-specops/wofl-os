@@ -160,10 +160,8 @@ fn handle_syscall(frame: &mut TrapFrame) {
             crate::kprintln!("Ready for Layer 3 (IPC & capabilities).");
             loop { unsafe { asm!("wfi"); } }
         }
-        SYS_SEND | SYS_RECV => {
-            crate::kprintln!("[SYSCALL] IPC not yet implemented (Layer 3)");
-            frame.regs[9] = usize::MAX;
-        }
+        SYS_SEND => { crate::ipc::sys_send(frame); }
+        SYS_RECV => { crate::ipc::sys_recv(frame); }
         SYS_SEND_REMOTE | SYS_RECV_REMOTE | SYS_NODE_DISCOVER => {
             crate::kprintln!("[SYSCALL] Distributed op not yet implemented (Layer 6)");
             frame.regs[9] = usize::MAX;

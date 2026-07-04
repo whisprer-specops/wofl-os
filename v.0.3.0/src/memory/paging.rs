@@ -134,3 +134,37 @@ pub unsafe fn init() -> usize {
 
     root
 }
+
+// ---- Layer 3 addition: page-table walk (uaccess validation, later fork/DMA) ----
+
+/// Walk the Sv39 table `root` for virtual address `va`. Returns
+/// `(physical_addr, leaf_flags)` if mapped, else `None`. Handles a leaf at any
+/// level (4 KiB / 2 MiB / 1 GiB), so it works for user 4K pages AND the kernel's
+/// 2M identity megapages. Reusable by L3 uaccess, L4 fork/mmap, L6 DMA setup.
+///
+/// SAFETY: reads page-table memory via the identity map; `root` must be a live
+/// Sv39 root (it is — `kernel_root()`), single-hart so no concurrent PT edits.
+pub unsafe fn translate(root: usize, va: usize) -> Option<(usize, usize)> {
+    let vpn = [(va >> 12) & 0x1FF, (va >> 21) & 0x1FF, (va >> 30) & 0x1FF];
+    let mut table = root;
+    let mut level: i32 = 2; // Sv39 walk starts at the root (level 2)
+    while level >= 0 {
+        let pte = (table as *const u64).add(vpn[level as usize]).read_volatile() as usize;
+        if pte & PTE_V == 0 {
+            return None; // slot empty -> unmapped
+        }
+        if pte & (PTE_R | PTE_W | PTE_X) != 0 {
+            // Leaf. Reconstruct PA: high bits from PPN, low (12 + 9*level) bits
+            // are the in-page offset taken from the VA (handles megapages).
+            let ppn = pte >> 10;
+            let off_bits = 12 + 9 * (level as usize);
+            let off_mask = (1usize << off_bits) - 1;
+            let pa = ((ppn << 12) & !off_mask) | (va & off_mask);
+            return Some((pa, pte & 0x3FF)); // flags = low 10 bits
+        }
+        // Non-leaf: descend to the child table this PTE points at.
+        table = (pte >> 10) << 12;
+        level -= 1;
+    }
+    None
+}
