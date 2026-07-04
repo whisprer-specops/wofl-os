@@ -8,19 +8,14 @@ MEMORY {
 SECTIONS {
     . = ORIGIN(RAM);
     __kernel_start = .;
-    
+
     .text : ALIGN(4096) {
         *(.text.boot)
         *(.text .text.*)
     } > RAM
 
-    .rodata : ALIGN(4096) {
-        *(.rodata .rodata.*)
-    } > RAM
-
-    .data : ALIGN(4096) {
-        *(.data .data.*)
-    } > RAM
+    .rodata : ALIGN(4096) { *(.rodata .rodata.*) } > RAM
+    .data   : ALIGN(4096) { *(.data .data.*) } > RAM
 
     .bss : ALIGN(4096) {
         __bss_start = .;
@@ -28,11 +23,18 @@ SECTIONS {
         *(COMMON)
         __bss_end = .;
     } > RAM
-    
+
+    /* Kernel stack: placed AFTER .bss so the .bss clear never wipes it.
+       NOLOAD keeps 64K of zeros out of the ELF image. */
+    . = ALIGN(16);
+    .kstack (NOLOAD) : ALIGN(16) {
+        __kernel_stack_bottom = .;
+        . += 64K;
+        __kernel_stack_top = .;
+    } > RAM
+
     . = ALIGN(4096);
     __kernel_end = .;
 
-    /DISCARD/ : {
-        *(.eh_frame)
-    }
+    /DISCARD/ : { *(.eh_frame) }
 }

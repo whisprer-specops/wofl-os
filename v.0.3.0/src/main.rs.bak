@@ -22,8 +22,9 @@ use uart::Uart;
 /// - .bss cleared
 /// - memory subsystem initialized (frame + heap)
 /// - jump to `kernel_main()`
+#[link_section = ".text.boot"]
 #[no_mangle]
-pub extern "C" fn rust_start() -> ! {
+pub extern "C" fn _start() -> ! {
     let uart = Uart::new(0x1000_0000);
     uart.puts("[BOOT] kernel_main entered\n");
 
@@ -92,16 +93,3 @@ fn alloc_error(_layout: core::alloc::Layout) -> ! {
         unsafe { asm!("wfi"); }
     }
 }
-
-// ---- Assembly boot entry (the stack fix) ----
-// This is the linker's ENTRY point. It sets sp to our reserved kernel stack
-// BEFORE any Rust runs, then tail-calls rust_start. Without this we ran on
-// OpenSBI's leftover sp, which points into its own PMP-protected memory -> the
-// first stack store faulted forever (the storm we've been chasing).
-core::arch::global_asm!(r#"
-.section .text.boot
-.global _start
-_start:
-    la   sp, __kernel_stack_top
-    tail rust_start
-"#);
