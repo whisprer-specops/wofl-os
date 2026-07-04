@@ -10,6 +10,7 @@
 /// Layer 1 core syscalls
 pub const SYS_TEST: usize = 0; // return 42
 pub const SYS_EXIT: usize = 1; // halt for now
+pub const SYS_YIELD: usize = 2; // cooperative: save frame, switch root, resume next
 
 /// Reserved for Layer 3 IPC
 pub const SYS_SEND: usize = 10;
@@ -24,6 +25,7 @@ pub fn syscall_name(n: usize) -> &'static str {
     match n {
         SYS_TEST => "SYS_TEST",
         SYS_EXIT => "SYS_EXIT",
+        SYS_YIELD => "SYS_YIELD",
         SYS_SEND => "SYS_SEND",
         SYS_RECV => "SYS_RECV",
         SYS_SEND_REMOTE => "SYS_SEND_REMOTE",

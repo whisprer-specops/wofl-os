@@ -4,6 +4,7 @@ use core::arch::asm;
 use crate::syscall::*;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct TrapFrame {
     pub regs: [usize; 31],
     pub sepc: usize,
@@ -159,6 +160,10 @@ fn handle_syscall(frame: &mut TrapFrame) {
             crate::kprintln!("Layer 2 (memory protection) HARDENED - trap runs on trusted stack, SUM off.");
             crate::kprintln!("Ready for Layer 3 (IPC & capabilities).");
             loop { unsafe { asm!("wfi"); } }
+        }
+        SYS_YIELD => {
+            crate::process::yield_to_next(frame);
+            return; // yield handles sepc itself - MUST skip the shared +4 below
         }
         SYS_SEND => { crate::ipc::sys_send(frame); }
         SYS_RECV => { crate::ipc::sys_recv(frame); }

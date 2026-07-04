@@ -70,9 +70,16 @@ fn kernel_main_inner() -> ! {
     // Layer 4 step B1: spawn a process with its OWN Sv39 root, switch satp to
     // it, and enter. Proves per-process address space + satp switch by running
     // the self-IPC test under a fresh root instead of the shared kernel root.
-    let (src, len) = user_prog::image();
-    let proc = unsafe { process::Process::new_user(src, len) };
-    process::run_first(&proc)
+    // Layer 4 step B2a: spawn TWO processes in separate address spaces.
+    // A yields immediately; the cooperative switch carries execution into B,
+    // which exits sentinel 5. Proves save-frame/switch-satp/restore-frame.
+    let (a_src, a_len) = user_prog::image_a();
+    let (b_src, b_len) = user_prog::image_b();
+    unsafe {
+        process::spawn(a_src, a_len);   // pid 1, slot 0
+        process::spawn(b_src, b_len);   // pid 2, slot 1
+        process::run_first(0)
+    }
 }
 
 #[panic_handler]
