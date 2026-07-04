@@ -11,23 +11,16 @@ mod uart;
 mod memory;
 mod syscall;
 mod trap;
-mod user_test;
+mod user_prog;
 
 use uart::Uart;
 
 /// Boot entry. This is the very first Rust code that runs.
-///
-/// Keep it brutally small:
-/// - UART online
-/// - .bss cleared
-/// - memory subsystem initialized (frame + heap)
-/// - jump to `kernel_main()`
 #[no_mangle]
 pub extern "C" fn rust_start() -> ! {
     let uart = Uart::new(0x1000_0000);
     uart.puts("[BOOT] kernel_main entered\n");
 
-    // Clear .bss (uninitialized globals)
     extern "C" {
         static mut __bss_start: u8;
         static mut __bss_end: u8;
@@ -42,13 +35,11 @@ pub extern "C" fn rust_start() -> ! {
     }
     uart.puts("[BOOT] .bss cleared\n");
 
-    // Initialize memory system (frame allocator + heap)
     let kernel_end = unsafe { &raw const __kernel_end as *const u8 as usize };
     let memory_end = 0x8800_0000; // QEMU virt, 128MB RAM top
     unsafe { memory::init(kernel_end, memory_end) };
     uart.puts("[BOOT] memory initialized\n");
 
-    // Continue with the real kernel
     kernel_main_inner()
 }
 
@@ -62,32 +53,19 @@ fn kernel_main_inner() -> ! {
     crate::kprintln!("============================================");
     crate::kprintln!("[OK] woflOS v0.4.0 (Layer 2 bring-up)");
 
-    // Layer 1: install the trap vector FIRST. If enabling paging below faults
-    // on a mapping we got wrong, the hardened handler prints ONE diagnostic
-    // line and halts instead of storming. Arm the net before the high-wire act.
+    // Arm the trap vector FIRST so any fault while enabling paging / entering
+    // user mode gets one clean diagnostic line instead of a storm.
     trap::init();
 
-    // ---- Layer 2, step 1: enable Sv39 paging (kernel-only address space) ----
-    // No U bit anywhere yet, so the Layer 1 user test is GATED OFF below. This
-    // step proves the satp / sfence.vma / TLB machinery works in isolation:
-    // the kernel keeps running -- printing, using its stack -- but now every
-    // address it touches goes through a page table it walks in hardware.
+    // Layer 2, step 1: enable Sv39 (kernel-only address space).
     let root = unsafe { memory::paging::init() };
     crate::kprintln!("[L2] Sv39 paging ENABLED (root PT @ {:#x})", root);
     crate::kprintln!("[L2] kernel now executing under virtual->physical translation");
 
-    // ---- Layer 1 user test: GATED OFF for step 1 ----
-    // Re-enabled in step 2, once user code + stack get real U-bit page mappings.
-    // let user_entry = user_test::user_main as usize;
-    // let user_stack_top = user_test::get_user_stack_top();
-    // crate::kprintln!("[L1] entering user mode: entry={:#x} stack_top={:#x}", user_entry, user_stack_top);
-    // let frame = trap::create_test_user_context(user_entry, user_stack_top);
-    // trap::enter_user_mode(&frame)
-
-    crate::kprintln!("");
-    crate::kprintln!("*** Layer 2 Step 1: PAGING OPERATIONAL ***");
-    crate::kprintln!("Kernel survived the satp switch. Ready for user mappings.");
-    loop { unsafe { asm!("wfi"); } }
+    // Layer 2, step 2: stage the first user program in REAL mapped U-pages and
+    // drop to U-mode. The ecall round-trip now runs through genuine page tables
+    // with enforced U/S separation. Never returns.
+    user_prog::launch()
 }
 
 #[panic_handler]
@@ -96,24 +74,16 @@ fn panic(info: &PanicInfo) -> ! {
     if let Some(loc) = info.location() {
         crate::kprintln!("[PANIC] at {}:{}", loc.file(), loc.line());
     }
-    loop {
-        unsafe { asm!("wfi"); }
-    }
+    loop { unsafe { asm!("wfi"); } }
 }
 
 #[alloc_error_handler]
 fn alloc_error(_layout: core::alloc::Layout) -> ! {
     crate::kprintln!("\n[PANIC] allocation error");
-    loop {
-        unsafe { asm!("wfi"); }
-    }
+    loop { unsafe { asm!("wfi"); } }
 }
 
 // ---- Assembly boot entry (the stack fix) ----
-// This is the linker's ENTRY point. It sets sp to our reserved kernel stack
-// BEFORE any Rust runs, then tail-calls rust_start. Without this we ran on
-// OpenSBI's leftover sp, which points into its own PMP-protected memory -> the
-// first stack store faulted forever (the storm we've been chasing).
 core::arch::global_asm!(r#"
 .section .text.boot
 .global _start
