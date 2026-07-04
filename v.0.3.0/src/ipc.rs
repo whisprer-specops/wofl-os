@@ -124,7 +124,7 @@ impl IpcError {
 /// Rejects any page lacking U|R. SUM stays off throughout.
 unsafe fn copy_from_user(dst: &mut [u8], user_va: usize, len: usize) -> Result<(), IpcError> {
     if len > dst.len() { return Err(IpcError::BadLength); }
-    let root = paging::kernel_root();
+    let root = paging::current_root(); // running process address space (satp), not kernel
     let mut done = 0;
     while done < len {
         let va = user_va + done;
@@ -142,7 +142,7 @@ unsafe fn copy_from_user(dst: &mut [u8], user_va: usize, len: usize) -> Result<(
 /// Rejects any page lacking U|W. SUM stays off throughout.
 unsafe fn copy_to_user(user_va: usize, src: &[u8], len: usize) -> Result<(), IpcError> {
     if len > src.len() { return Err(IpcError::BadLength); }
-    let root = paging::kernel_root();
+    let root = paging::current_root(); // running process address space (satp), not kernel
     let mut done = 0;
     while done < len {
         let va = user_va + done;

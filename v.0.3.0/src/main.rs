@@ -12,6 +12,7 @@ mod memory;
 mod syscall;
 mod trap;
 mod ipc;
+mod process;
 mod user_prog;
 
 use uart::Uart;
@@ -66,7 +67,12 @@ fn kernel_main_inner() -> ! {
     // Layer 2, step 2: stage the first user program in REAL mapped U-pages and
     // drop to U-mode. The ecall round-trip now runs through genuine page tables
     // with enforced U/S separation. Never returns.
-    user_prog::launch()
+    // Layer 4 step B1: spawn a process with its OWN Sv39 root, switch satp to
+    // it, and enter. Proves per-process address space + satp switch by running
+    // the self-IPC test under a fresh root instead of the shared kernel root.
+    let (src, len) = user_prog::image();
+    let proc = unsafe { process::Process::new_user(src, len) };
+    process::run_first(&proc)
 }
 
 #[panic_handler]
