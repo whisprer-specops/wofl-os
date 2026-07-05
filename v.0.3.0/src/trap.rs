@@ -60,6 +60,16 @@ pub fn enable_timer() {
         crate::sbi::TIMER_INTERVAL);
 }
 
+/// Arm supervisor EXTERNAL interrupts: sie.SEIE on. Same delivery contract
+/// as the timer: always deliverable from U-mode; from S-mode only inside an
+/// explicitly scoped sstatus.SIE window (the kernel stays non-preemptible -
+/// that invariant does NOT change at L6d, the boot test just opens a bounded,
+/// commented listening window and closes it again).
+pub fn enable_external() {
+    unsafe { asm!("csrs sie, {b}", b = in(reg) 1usize << 9); } // SEIE
+    crate::kprintln!("[TRAP] external interrupts armed (sie.SEIE)");
+}
+
 pub fn create_test_user_context(entry: usize, stack: usize) -> TrapFrame {
     let mut frame = TrapFrame::zero();
     frame.sepc = entry;
@@ -150,6 +160,24 @@ fn handle_interrupt(code: usize, frame: &mut TrapFrame) {
             // resumes AT the interrupted instruction. A +4 here would skip a
             // random user instruction - corruption that differs every boot.
             crate::process::preempt(frame);
+        }
+        9 => { // supervisor external interrupt (PLIC) — first device IRQ, L6d
+            let irq = crate::plic::claim();
+            if irq == 0 {
+                // Spurious: another claimant got there first, or a glitch.
+                // Nothing claimed -> nothing to complete. Just resume.
+                return;
+            }
+            if irq == crate::plic::IRQ_VIRTIO_NET {
+                crate::virtio::handle_irq();
+            } else {
+                crate::kprintln!("[TRAP] PLIC delivered unexpected irq {}", irq);
+            }
+            // MANDATORY pair to claim() - miss this and IRQ 8 never fires again.
+            crate::plic::complete(irq);
+            // NO sepc adjustment: an interrupt resumes AT the interrupted
+            // instruction - same sacred rule as the timer arm above. In the
+            // L6d boot window that's the instruction after the wfi.
         }
         _ => {
             crate::kprintln!("[TRAP] unexpected interrupt {} - halting", code);

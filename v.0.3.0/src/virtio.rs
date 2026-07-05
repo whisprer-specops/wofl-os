@@ -356,6 +356,114 @@ pub fn tx_one(nic: &mut VirtioNet, tx_buf: usize, payload: &[u8]) -> Result<u32,
     Ok(len)
 }
 
+
+// ---------------------------------------------------------------------------
+// L6d: RX path — pre-posted device-writable buffers + interrupt-driven drain
+// ---------------------------------------------------------------------------
+
+use core::sync::atomic::{AtomicU32, Ordering};
+
+/// Frames received & parsed. Atomic because the IRQ handler increments it
+/// while the boot thread polls it across the wfi window.
+pub static RX_SEEN: AtomicU32 = AtomicU32::new(0);
+
+pub const RX_BUFS: usize = 8;
+pub const RX_BUF_LEN: usize = 512; // 8 x 512 = one 4 KiB frame exactly
+
+/// Post RX_BUFS device-WRITABLE buffers. MUST run before any frame can
+/// arrive (i.e. before our TX in the mcast-echo test) - an RX queue with no
+/// posted buffers means the device silently drops incoming frames.
+pub fn post_rx(nic: &mut VirtioNet, rx_frame: usize) {
+    for i in 0..RX_BUFS {
+        unsafe {
+            nic.rx.desc_ptr(i).write_volatile(VqDesc {
+                addr: (rx_frame + i * RX_BUF_LEN) as u64,
+                len: RX_BUF_LEN as u32,
+                flags: DESC_F_WRITE, // device writes INTO these - the TX mirror
+                next: 0,
+            });
+            nic.rx.avail_ring(i).write_volatile(i as u16);
+        }
+    }
+    dma_fence();
+    unsafe { nic.rx.avail_idx().write_volatile(RX_BUFS as u16); }
+    dma_fence();
+    reg_write(nic.base, R_QUEUE_NOTIFY, VQ_RX);
+    crate::kprintln!("[L6] RX: {} buffers posted ({}B each, frame @0x{:x})",
+        RX_BUFS, RX_BUF_LEN, rx_frame);
+}
+
+/// Parse one received buffer: skip the 12-byte vnet header (present on RX
+/// exactly as on TX), print the Ethernet triple, and if it is our EtherType,
+/// the payload text.
+fn rx_parse(buf: usize, len: usize) {
+    if len < VNET_HDR_LEN + 14 {
+        crate::kprintln!("[L6] RX: runt ({} bytes) - ignored", len);
+        return;
+    }
+    let eth = (buf + VNET_HDR_LEN) as *const u8;
+    unsafe {
+        let ethertype = ((eth.add(12).read() as u16) << 8) | eth.add(13).read() as u16;
+        crate::kprintln!(
+            "[L6] RX: {} bytes dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} \
+src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} type=0x{:04x}",
+            len - VNET_HDR_LEN,
+            eth.read(), eth.add(1).read(), eth.add(2).read(),
+            eth.add(3).read(), eth.add(4).read(), eth.add(5).read(),
+            eth.add(6).read(), eth.add(7).read(), eth.add(8).read(),
+            eth.add(9).read(), eth.add(10).read(), eth.add(11).read(),
+            ethertype
+        );
+        if ethertype == ETHERTYPE_WOFL {
+            let pl = eth.add(14);
+            let pl_len = core::cmp::min(len - VNET_HDR_LEN - 14, 32);
+            let mut txt = [0u8; 32];
+            for i in 0..pl_len { txt[i] = pl.add(i).read(); }
+            // trim trailing padding zeros for the print
+            let end = txt.iter().position(|&b| b == 0).unwrap_or(pl_len);
+            if let Ok(s) = core::str::from_utf8(&txt[..end]) {
+                crate::kprintln!("[L6] RX payload: \"{}\"", s);
+            }
+        }
+    }
+    RX_SEEN.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Called from the trap handler's code-9 arm, BETWEEN plic::claim() and
+/// plic::complete(). Ack the device, drain the RX used ring, repost each
+/// buffer so the ring never starves.
+pub fn handle_irq() {
+    unsafe {
+        let nic = match NIC.as_mut() { Some(n) => n, None => return };
+        // Device-level ack (distinct from the PLIC-level complete): read
+        // InterruptStatus, write it back to InterruptACK. Skip this and the
+        // device's line stays asserted -> re-fires forever.
+        let int = reg_read(nic.base, R_INT_STATUS);
+        reg_write(nic.base, R_INT_ACK, int);
+
+        loop {
+            dma_fence(); // order our used-ring reads after device's writes
+            let used = nic.rx.used_idx().read_volatile();
+            if used == nic.rx.last_used { break; }
+            let slot = nic.rx.last_used as usize % nic.rx.size;
+            let id = nic.rx.used_elem(slot).read_volatile() as usize;
+            let len = nic.rx.used_elem(slot).add(1).read_volatile() as usize;
+            nic.rx.last_used = nic.rx.last_used.wrapping_add(1);
+
+            let buf = nic.rx.desc_ptr(id).read_volatile().addr as usize;
+            rx_parse(buf, len);
+
+            // Repost the same descriptor - ring stays full forever.
+            let idx = nic.rx.avail_idx().read_volatile();
+            nic.rx.avail_ring(idx as usize % nic.rx.size).write_volatile(id as u16);
+            dma_fence();
+            nic.rx.avail_idx().write_volatile(idx.wrapping_add(1));
+            dma_fence();
+            reg_write(nic.base, R_QUEUE_NOTIFY, VQ_RX);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bring-up entry — call BEFORE any process spawns (roots snapshot kernel maps;
 // also keeps the frame-baseline print meaningful: baseline is now 5, not 3,
@@ -396,18 +504,48 @@ pub fn l6_bringup() {
 
     unsafe { NIC = Some(VirtioNet { base, mac, negotiated, rx, tx }); }
 
-    // L6c: one frame out the door. Dedicated TX buffer frame (driver-owned
-    // forever — frame baseline is now 6). Payload is our hello to the wire.
+    // L6d sequence. ORDER IS LOAD-BEARING:
+    //   1. post RX buffers   (before any frame can arrive)
+    //   2. PLIC + SEIE       (before the TX whose echo we want to hear)
+    //   3. TX the hello      (mcast netdev loops it back at us)
+    //   4. scoped SIE window (the ONLY S-mode moment interrupts may land)
     let tx_buf = match crate::memory::frame::alloc_frame() {
         Some(f) => f,
         None => { crate::kprintln!("[L6] OOM allocating TX buffer"); return; }
     };
+    let rx_frame = match crate::memory::frame::alloc_frame() {
+        Some(f) => f,
+        None => { crate::kprintln!("[L6] OOM allocating RX buffers"); return; }
+    };
     unsafe {
         if let Some(nic) = NIC.as_mut() {
-            match tx_one(nic, tx_buf, b"woflOS node 0 says hello") {
-                Ok(_) => crate::kprintln!("[L6] L6c complete — frame on the wire; RX via PLIC is L6d"),
-                Err(e) => crate::kprintln!("[L6] L6c TX FAILED: {}", e),
+            post_rx(nic, rx_frame);                          // 1
+            crate::plic::enable_irq(crate::plic::IRQ_VIRTIO_NET); // 2
+            crate::trap::enable_external();
+            match tx_one(nic, tx_buf, b"woflOS node 0 says hello") { // 3
+                Ok(_) => {}
+                Err(e) => { crate::kprintln!("[L6] TX FAILED: {}", e); return; }
             }
+        } else { return; }
+    }
+    // 4. Scoped listening window. The kernel-non-preemptible invariant says
+    // sstatus.SIE stays 0 in S-mode - this is a DELIBERATE, BOUNDED, LOCAL
+    // exception for the boot test only (no processes exist yet, so U-mode
+    // delivery is not available). SIE on -> wfi until RX or bound -> SIE off.
+    // In steady state RX interrupts land from U-mode like the timer does.
+    {
+        let mut waits = 0u32;
+        unsafe { core::arch::asm!("csrs sstatus, {b}", b = in(reg) 1usize << 1); } // SIE ON
+        while RX_SEEN.load(Ordering::SeqCst) == 0 {
+            unsafe { core::arch::asm!("wfi"); }
+            waits += 1;
+            if waits > 10_000 { break; }
+        }
+        unsafe { core::arch::asm!("csrc sstatus, {b}", b = in(reg) 1usize << 1); } // SIE OFF - window closed
+        if RX_SEEN.load(Ordering::SeqCst) > 0 {
+            crate::kprintln!("[L6] L6d complete - kernel heard the wire (window: {} wfi wakes)", waits);
+        } else {
+            crate::kprintln!("[L6] L6d FAILED - no RX within window (is -netdev socket,mcast=... on the line?)");
         }
     }
 }
