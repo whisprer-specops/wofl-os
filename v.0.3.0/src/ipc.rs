@@ -168,9 +168,78 @@ fn recv_local(ep: usize, out: &mut IPCMessage) -> Result<(), IpcError> {
     Ok(())
 }
 
-fn send_remote(node_id: u32, _msg: &IPCMessage) -> Result<(), IpcError> {
-    crate::kprintln!("[IPC] send_remote: node {} unreachable - networking is Layer 6", node_id);
-    Err(IpcError::RemoteUnreachable)
+fn send_remote(node_id: u32, msg: &IPCMessage) -> Result<(), IpcError> {
+    // L6e: the seam closes. IPCMessage is repr(C), fixed-size, pointer-free -
+    // its byte image IS the wire format. No serialization layer needed; this
+    // was the design bet made at Layer 3, cashing out now.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(msg as *const IPCMessage as *const u8,
+                                    core::mem::size_of::<IPCMessage>())
+    };
+    match crate::virtio::net_send_ipc(bytes) {
+        Ok(()) => {
+            crate::kprintln!("[IPC] send_remote: {} bytes -> node {} ON THE WIRE",
+                bytes.len(), node_id);
+            Ok(())
+        }
+        Err(e) => {
+            crate::kprintln!("[IPC] send_remote: node {} unreachable ({})", node_id, e);
+            Err(IpcError::RemoteUnreachable)
+        }
+    }
+}
+
+/// L6e: called from the RX interrupt path when a WOFL frame carries a
+/// serialized IPCMessage. Deliver to the local endpoint it addresses.
+///
+/// SAFETY (touching ENDPOINTS from IRQ context): single hart, and the only
+/// S-mode code that ever runs with SIE open is the boot/listen wfi loop,
+/// which touches NO IPC state - so this cannot interleave with a half-done
+/// endpoint operation. If a future SIE window ever wraps IPC-touching kernel
+/// code, this needs a lock FIRST. (Ledger: same entry as ENDPOINTS/TABLE.)
+pub fn deliver_remote(bytes: &[u8]) {
+    const MSG: usize = core::mem::size_of::<IPCMessage>();
+    if bytes.len() < MSG {
+        crate::kprintln!("[IPC] remote: short frame ({} bytes) - dropped", bytes.len());
+        return;
+    }
+    let mut msg = IPCMessage::zero();
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(),
+            &mut msg as *mut IPCMessage as *mut u8, MSG);
+    }
+    // mcast is a party line: everyone hears everything. Not ours -> silence.
+    if msg.dst_cap.node_id != crate::NODE_ID { return; }
+
+    // Checksum was computed on the sender with the field still ZERO, then
+    // stored into it. Recomputing naively would include the populated field
+    // and ALWAYS mismatch - zero, recompute, compare. (Works whether or not
+    // compute_checksum skips the field internally.)
+    let received = msg.checksum;
+    msg.checksum = 0;
+    let computed = compute_checksum(&msg);
+    msg.checksum = received;
+    if computed != received {
+        crate::kprintln!("[IPC] remote: checksum mismatch - dropped");
+        return;
+    }
+
+    let ep = msg.dst_cap.service_id as usize;
+    match send_local(ep, &msg) {
+        Ok(()) => {
+            crate::process::wake_endpoint(ep);
+            let n = core::cmp::min(msg.payload_len as usize, 24);
+            if let Ok(s) = core::str::from_utf8(&msg.payload[..n]) {
+                crate::kprintln!(
+                    "[IPC] REMOTE DELIVERED: {} bytes -> ep {} (from node {} ep {}) payload \"{}\"",
+                    msg.payload_len, ep, msg.src_cap.node_id, msg.src_cap.service_id, s);
+            } else {
+                crate::kprintln!("[IPC] REMOTE DELIVERED: {} bytes -> ep {} (from node {} ep {})",
+                    msg.payload_len, ep, msg.src_cap.node_id, msg.src_cap.service_id);
+            }
+        }
+        Err(_) => crate::kprintln!("[IPC] remote: ep {} rejected (full/bad) - dropped", ep),
+    }
 }
 
 fn route_send(msg: &IPCMessage) -> Result<(), IpcError> {
@@ -197,7 +266,7 @@ pub fn sys_send(frame: &mut TrapFrame) {
         let mut msg = IPCMessage::zero();
         msg.version  = 1;
         msg.msg_type = MSG_DATA;
-        msg.src_cap  = Capability::endpoint(0, rep_ep, CAP_SEND | CAP_RECV); // return address
+        msg.src_cap  = Capability::endpoint(crate::NODE_ID, rep_ep, CAP_SEND | CAP_RECV); // return address (REAL node id - L6e)
         msg.dst_cap  = Capability::endpoint(node, dst_ep, CAP_SEND | CAP_RECV);
         msg.payload_len = len as u32;
         if msg.dst_cap.permissions & CAP_SEND == 0 { return Err(IpcError::NoPermission); }

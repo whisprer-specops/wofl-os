@@ -86,6 +86,10 @@ pub unsafe fn map_4k(root: usize, va: usize, pa: usize, flags: usize) {
 /// reach any physical frame — while user mode still can't touch kernel memory.
 pub unsafe fn map_kernel_into(root: usize) {
     map_2mb(root, 0x1000_0000, 0x1000_0000, LEAF_MMIO); // uart8250
+    // PLIC (L6d): priorities/enables in the low window, per-context
+    // threshold+claim at +0x20_0000. Two megapages cover both.
+    map_2mb(root, 0x0c00_0000, 0x0c00_0000, LEAF_MMIO);
+    map_2mb(root, 0x0c20_0000, 0x0c20_0000, LEAF_MMIO);
     let mut pa = 0x8000_0000usize;
     while pa < 0x8800_0000 {
         map_2mb(root, pa, pa, LEAF_RAM);
