@@ -49,6 +49,14 @@ pub extern "C" fn rust_start() -> ! {
     kernel_main_inner()
 }
 
+/// This node's identity (L6e: crude-but-honest build-time const; promoted to
+/// real discovery/config at Layer 7). Set via env at build: NODE_ID=1 ./build.sh
+/// option_env! is tracked by cargo - changing it triggers a rebuild.
+pub const NODE_ID: u32 = {
+    let b = match option_env!("NODE_ID") { Some(s) => s.as_bytes(), None => b"0" };
+    (b[0] - b'0') as u32
+};
+
 fn kernel_main_inner() -> ! {
     crate::kprintln!("");
     crate::kprintln!("============================================");
@@ -92,6 +100,16 @@ fn kernel_main_inner() -> ! {
     // for requests; the client resolves /net/node0/... and /net/node1/... into
     // capabilities and uses the node1 cap to hit the Layer 6 remote seam. The
     // kernel never learns what a path is - the VFS is just another program.
+    // L6e: a non-zero node doesn't run the demo - it LISTENS. Remote
+    // IPCMessages arrive via the RX interrupt and deliver_remote() drops them
+    // into local endpoints. SIE stays open here permanently: sound because
+    // this loop touches no IPC state (see deliver_remote's SAFETY note).
+    if NODE_ID != 0 {
+        crate::kprintln!("[L6] node {} up - listening for remote IPC (Ctrl+A X to quit)", NODE_ID);
+        unsafe { core::arch::asm!("csrs sstatus, {b}", b = in(reg) 1usize << 1); }
+        loop { unsafe { core::arch::asm!("wfi"); } }
+    }
+
     let vfs_img = user_prog::vfs_image();
     let client_img = user_prog::client_image();
     let client_b_img = user_prog::client_b_image();

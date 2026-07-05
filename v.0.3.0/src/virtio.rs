@@ -158,6 +158,7 @@ pub struct VirtioNet {
     pub negotiated: u64,
     pub rx: Virtqueue,
     pub tx: Virtqueue,
+    pub tx_buf: usize, // L6e: persistent TX staging frame
 }
 
 pub static mut NIC: Option<VirtioNet> = None;
@@ -414,6 +415,19 @@ src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} type=0x{:04x}",
             eth.add(9).read(), eth.add(10).read(), eth.add(11).read(),
             ethertype
         );
+        // L6e: magic-prefixed frames carry a serialized IPCMessage.
+        if ethertype == ETHERTYPE_WOFL && len >= VNET_HDR_LEN + 14 + 4 {
+            let pl = eth.add(14);
+            const MSG: usize = core::mem::size_of::<crate::ipc::IPCMessage>();
+            if pl.read() == b'W' && pl.add(1).read() == b'O'
+                && pl.add(2).read() == b'F' && pl.add(3).read() == b'L'
+                && len - VNET_HDR_LEN - 14 - 4 >= MSG {
+                let body = core::slice::from_raw_parts(pl.add(4), MSG);
+                crate::ipc::deliver_remote(body);
+                RX_SEEN.fetch_add(1, Ordering::SeqCst);
+                return;
+            }
+        }
         if ethertype == ETHERTYPE_WOFL {
             let pl = eth.add(14);
             let pl_len = core::cmp::min(len - VNET_HDR_LEN - 14, 32);
@@ -464,6 +478,36 @@ pub fn handle_irq() {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// L6e: IPCMessage on the wire - [eth 0x88B5][b"WOFL"][message bytes]
+// ---------------------------------------------------------------------------
+
+/// Wire fit: vnet hdr + eth hdr + magic + message must fit one RX buffer.
+/// Bumping IPC_PAYLOAD_MAX (design target 4096) FAILS THIS BUILD instead of
+/// silently truncating DMA - grow RX_BUF_LEN/buffer scheme together with it.
+const _: () = assert!(
+    VNET_HDR_LEN + 14 + 4 + core::mem::size_of::<crate::ipc::IPCMessage>() <= RX_BUF_LEN
+);
+
+/// TX a serialized IPCMessage. Called from the syscall path (send_remote),
+/// so it runs on the kernel trap stack - the ~370B staging array is fine
+/// against 16 KiB. Polls TX completion like tx_one (interrupt-driven TX is
+/// an optimisation for later; correctness first).
+pub fn net_send_ipc(bytes: &[u8]) -> Result<(), &'static str> {
+    const MSG: usize = core::mem::size_of::<crate::ipc::IPCMessage>();
+    if bytes.len() != MSG { return Err("bad IPCMessage size"); }
+    let mut payload = [0u8; 4 + MSG];
+    payload[0..4].copy_from_slice(b"WOFL");
+    payload[4..].copy_from_slice(bytes);
+    unsafe {
+        let nic = NIC.as_mut().ok_or("NIC not initialised")?;
+        if nic.tx_buf == 0 { return Err("TX buffer not allocated"); }
+        let buf = nic.tx_buf;
+        tx_one(nic, buf, &payload).map(|_| ())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bring-up entry — call BEFORE any process spawns (roots snapshot kernel maps;
 // also keeps the frame-baseline print meaningful: baseline is now 5, not 3,
@@ -502,7 +546,7 @@ pub fn l6_bringup() {
     }
     crate::kprintln!("[L6] DRIVER_OK set — status=0x{:x}, device is LIVE", st);
 
-    unsafe { NIC = Some(VirtioNet { base, mac, negotiated, rx, tx }); }
+    unsafe { NIC = Some(VirtioNet { base, mac, negotiated, rx, tx, tx_buf: 0 }); }
 
     // L6d sequence. ORDER IS LOAD-BEARING:
     //   1. post RX buffers   (before any frame can arrive)
@@ -519,6 +563,7 @@ pub fn l6_bringup() {
     };
     unsafe {
         if let Some(nic) = NIC.as_mut() {
+            nic.tx_buf = tx_buf; // persist: send_remote TXes long after boot
             post_rx(nic, rx_frame);                          // 1
             crate::plic::enable_irq(crate::plic::IRQ_VIRTIO_NET); // 2
             crate::trap::enable_external();

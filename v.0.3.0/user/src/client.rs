@@ -21,8 +21,8 @@ pub extern "C" fn main() -> ! {
     let w_local  = write(fd_local,  &magic);
     let local_ok = (w_local as isize) >= 0;
     let w_remote = write(fd_remote, &magic);
-    let remote_stub_fired = (w_remote as isize) < 0;
+    let remote_ok = (w_remote as isize) >= 0; // L6e: the seam is CLOSED - remote write now SUCCEEDS
 
     close(fd_local); close(fd_remote);
-    sys_exit(if fds_ok && local_ok && remote_stub_fired { 7 } else { 0 })
+    sys_exit(if fds_ok && local_ok && remote_ok { 7 } else { 0 })
 }
