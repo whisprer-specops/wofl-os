@@ -279,6 +279,83 @@ fn setup_queue(base: usize, idx: u32) -> Result<Virtqueue, &'static str> {
     Ok(Virtqueue { frame, size: QUEUE_SIZE, last_used: 0 })
 }
 
+
+// ---------------------------------------------------------------------------
+// L6c: transmit one hand-built Ethernet frame (polled, no interrupts yet)
+// ---------------------------------------------------------------------------
+
+/// virtio-net header (spec §5.1.6). With VERSION_1 this is ALWAYS 12 bytes —
+/// num_buffers is present even though we declined MRG_RXBUF. Sending the
+/// 10-byte legacy header shifts the whole frame by 2 and garbles the wire.
+pub const VNET_HDR_LEN: usize = 12;
+
+/// Our EtherType: IEEE 802 local-experimental 1. woflOS's slot on the wire.
+pub const ETHERTYPE_WOFL: u16 = 0x88B5;
+
+/// Build hdr+frame into `buf` (PA==VA, device-reachable). Returns total len.
+/// Layout: [12B zeroed vnet hdr][6B dst][6B src][2B ethertype BE][payload]
+fn build_tx(buf: usize, src_mac: &[u8; 6], payload: &[u8]) -> usize {
+    unsafe {
+        core::ptr::write_bytes(buf as *mut u8, 0, VNET_HDR_LEN); // no offloads
+        let eth = (buf + VNET_HDR_LEN) as *mut u8;
+        for i in 0..6 { eth.add(i).write(0xFF); }                 // dst: broadcast
+        for i in 0..6 { eth.add(6 + i).write(src_mac[i]); }       // src: our MAC
+        eth.add(12).write((ETHERTYPE_WOFL >> 8) as u8);           // ethertype,
+        eth.add(13).write(ETHERTYPE_WOFL as u8);                  // big-endian
+        for (i, b) in payload.iter().enumerate() {
+            eth.add(14 + i).write(*b);
+        }
+    }
+    // Ethernet min payload is 46B (frame 60B before FCS); virtio devices pad,
+    // but we pad ourselves so the wire length is OURS, not device behavior.
+    let eth_len = core::cmp::max(14 + payload.len(), 60);
+    VNET_HDR_LEN + eth_len
+}
+
+/// TX one frame and poll the used ring for completion. Returns used len.
+pub fn tx_one(nic: &mut VirtioNet, tx_buf: usize, payload: &[u8]) -> Result<u32, &'static str> {
+    let total = build_tx(tx_buf, &nic.mac, payload);
+
+    // Descriptor 0: the whole buffer, device READS it (no WRITE flag), no chain.
+    unsafe {
+        nic.tx.desc_ptr(0).write_volatile(VqDesc {
+            addr: tx_buf as u64,
+            len: total as u32,
+            flags: 0,
+            next: 0,
+        });
+        // Publish: descriptor contents + ring slot must be globally visible
+        // BEFORE the avail index moves — the device DMAs the instant it sees
+        // the bump. Two fences, both load-bearing.
+        let idx = nic.tx.avail_idx().read_volatile();
+        nic.tx.avail_ring(idx as usize % nic.tx.size).write_volatile(0); // desc id 0
+        dma_fence();
+        nic.tx.avail_idx().write_volatile(idx.wrapping_add(1));
+        dma_fence();
+    }
+    reg_write(nic.base, R_QUEUE_NOTIFY, VQ_TX);
+
+    // Poll the used ring — bounded, so a dead device fails loudly not silently.
+    let mut spins = 0u64;
+    loop {
+        let used = unsafe { nic.tx.used_idx().read_volatile() };
+        if used != nic.tx.last_used { break; }
+        spins += 1;
+        if spins > 100_000_000 { return Err("TX: used ring never advanced"); }
+    }
+    // Device wrote the used elem before bumping used_idx; fence our read side
+    // so we observe them in that order too.
+    dma_fence();
+    let slot = nic.tx.last_used as usize % nic.tx.size;
+    let (id, len) = unsafe {
+        (nic.tx.used_elem(slot).read_volatile(),
+         nic.tx.used_elem(slot).add(1).read_volatile())
+    };
+    nic.tx.last_used = nic.tx.last_used.wrapping_add(1);
+    crate::kprintln!("[L6] TX complete: used id={} len={} ({} spins)", id, len, spins);
+    Ok(len)
+}
+
 // ---------------------------------------------------------------------------
 // Bring-up entry — call BEFORE any process spawns (roots snapshot kernel maps;
 // also keeps the frame-baseline print meaningful: baseline is now 5, not 3,
@@ -316,7 +393,21 @@ pub fn l6_bringup() {
         return;
     }
     crate::kprintln!("[L6] DRIVER_OK set — status=0x{:x}, device is LIVE", st);
-    crate::kprintln!("[L6] L6b complete — TX one frame is L6c");
 
     unsafe { NIC = Some(VirtioNet { base, mac, negotiated, rx, tx }); }
+
+    // L6c: one frame out the door. Dedicated TX buffer frame (driver-owned
+    // forever — frame baseline is now 6). Payload is our hello to the wire.
+    let tx_buf = match crate::memory::frame::alloc_frame() {
+        Some(f) => f,
+        None => { crate::kprintln!("[L6] OOM allocating TX buffer"); return; }
+    };
+    unsafe {
+        if let Some(nic) = NIC.as_mut() {
+            match tx_one(nic, tx_buf, b"woflOS node 0 says hello") {
+                Ok(_) => crate::kprintln!("[L6] L6c complete — frame on the wire; RX via PLIC is L6d"),
+                Err(e) => crate::kprintln!("[L6] L6c TX FAILED: {}", e),
+            }
+        }
+    }
 }

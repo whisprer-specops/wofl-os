@@ -79,7 +79,7 @@ fn kernel_main_inner() -> ! {
     // Layer 6a: probe virtio-mmio slots, init the NIC through FEATURES_OK.
     // The 0x1000_0000 2MiB MMIO megapage (map_kernel_into) already covers
     // the whole probe region, in the kernel root AND every process root.
-    virtio::l6a_bringup();
+    virtio::l6_bringup();
 
     let (used0, total0) = memory::frame::get_stats();
     crate::kprintln!("[L4] frame baseline before spawn: {}/{} in use", used0, total0);
