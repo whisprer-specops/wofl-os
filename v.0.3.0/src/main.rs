@@ -91,6 +91,10 @@ fn kernel_main_inner() -> ! {
     // the whole probe region, in the kernel root AND every process root.
     virtio::l6_bringup();
 
+    // L7a: announce our identity (pubkey fingerprint) now the NIC is up. Both
+    // node roles print this; it's the anchor line the discovery gates grep for.
+    crate::attest::print_identity();
+
     let (used0, total0) = memory::frame::get_stats();
     crate::kprintln!("[L4] frame baseline before spawn: {}/{} in use", used0, total0);
 
@@ -107,8 +111,63 @@ fn kernel_main_inner() -> ! {
     // this loop touches no IPC state (see deliver_remote's SAFETY note).
     if NODE_ID != 0 {
         crate::kprintln!("[L6] node {} up - listening for remote IPC (Ctrl+A X to quit)", NODE_ID);
+        // L7a: announce ourselves ONCE before opening SIE. SIE is still 0 here,
+        // so hello_tx_scoped's transient nic borrow is alone (no handle_irq can
+        // be running). After SIE opens we answer any further HELLOs reactively
+        // via handle_irq. Node 0 (boots second) may not exist yet - that's why
+        // node 0 ALSO retries; a single lost REQUEST here is recovered there.
+        match crate::virtio::hello_tx_scoped(crate::attest::HELLO_REQUEST) {
+            Ok(()) => crate::kprintln!("[L7a] node {} sent HELLO_REQUEST", NODE_ID),
+            Err(e) => crate::kprintln!("[L7a] node {} HELLO_REQUEST failed: {}", NODE_ID, e),
+        }
         unsafe { core::arch::asm!("csrs sstatus, {b}", b = in(reg) 1usize << 1); }
         loop { unsafe { core::arch::asm!("wfi"); } }
+    }
+
+    // ------------------------------------------------------------------
+    // L7a: node 0 discovery window. Node 0 runs the demo (which does remote
+    // IPC), so it MUST establish a session with each peer BEFORE spawning.
+    // Busy-poll, NOT wfi: between our own sends the only interrupt source is
+    // our OWN send's mcast echo, so a wfi here would sleep with nobody to wake
+    // it. We spin instead; incoming REPLYs still preempt the spin to run
+    // handle_irq (which establishes the session). Retry re-TXes periodically to
+    // survive frame loss - and each retry briefly DROPS SIE so the scoped nic
+    // borrow inside hello_tx_scoped can't alias handle_irq's borrow. A REPLY
+    // landing during that SIE-off blip is latched pending and fires when SIE
+    // reopens - not lost. Bound + fail-soft: on timeout we run solo and let the
+    // demo's send_remote fail VISIBLY rather than hang forever.
+    {
+        let want = crate::attest::expected_peer_count();
+        if want > 0 {
+            crate::kprintln!("[L7a] node 0 discovery: waiting for {} peer(s)...", want);
+            // Initial REQUEST (SIE still 0 from boot - borrow is alone).
+            match crate::virtio::hello_tx_scoped(crate::attest::HELLO_REQUEST) {
+                Ok(()) => crate::kprintln!("[L7a] node 0 sent HELLO_REQUEST"),
+                Err(e) => crate::kprintln!("[L7a] node 0 HELLO_REQUEST failed: {}", e),
+            }
+            unsafe { asm!("csrs sstatus, {b}", b = in(reg) 1usize << 1); } // SIE ON
+            let mut spins: u64 = 0;
+            const RETX_EVERY: u64 = 200_000;
+            const BOUND: u64 = 4_000_000;
+            while crate::attest::established_peer_count() < want {
+                unsafe { asm!("nop"); }
+                spins += 1;
+                if spins >= BOUND { break; }
+                if spins % RETX_EVERY == 0 {
+                    // Retry: close SIE so the scoped borrow is alone, TX, reopen.
+                    unsafe { asm!("csrc sstatus, {b}", b = in(reg) 1usize << 1); } // SIE OFF
+                    let _ = crate::virtio::hello_tx_scoped(crate::attest::HELLO_REQUEST);
+                    unsafe { asm!("csrs sstatus, {b}", b = in(reg) 1usize << 1); } // SIE ON
+                }
+            }
+            unsafe { asm!("csrc sstatus, {b}", b = in(reg) 1usize << 1); } // SIE OFF - window closed
+            let got = crate::attest::established_peer_count();
+            if got >= want {
+                crate::kprintln!("[L7a] node 0 discovery COMPLETE - {}/{} peer(s) established", got, want);
+            } else {
+                crate::kprintln!("[L7a] node 0 discovery TIMEOUT - {}/{} peer(s); running solo (remote IPC will fail)", got, want);
+            }
+        }
     }
 
     let vfs_img = user_prog::vfs_image();

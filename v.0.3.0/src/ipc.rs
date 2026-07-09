@@ -176,7 +176,7 @@ fn send_remote(node_id: u32, msg: &IPCMessage) -> Result<(), IpcError> {
         core::slice::from_raw_parts(msg as *const IPCMessage as *const u8,
                                     core::mem::size_of::<IPCMessage>())
     };
-    match crate::virtio::net_send_ipc(bytes) {
+    match crate::virtio::net_send_ipc(node_id as usize, bytes) {
         Ok(()) => {
             crate::kprintln!("[IPC] send_remote: {} bytes -> node {} ON THE WIRE",
                 bytes.len(), node_id);
@@ -197,7 +197,7 @@ fn send_remote(node_id: u32, msg: &IPCMessage) -> Result<(), IpcError> {
 /// which touches NO IPC state - so this cannot interleave with a half-done
 /// endpoint operation. If a future SIE window ever wraps IPC-touching kernel
 /// code, this needs a lock FIRST. (Ledger: same entry as ENDPOINTS/TABLE.)
-pub fn deliver_remote(bytes: &[u8]) {
+pub fn deliver_remote(src_node: usize, bytes: &[u8]) {
     const MSG: usize = core::mem::size_of::<IPCMessage>();
     const TAG: usize = crate::attest::TAG_LEN;
     if bytes.len() < MSG + TAG {
@@ -205,16 +205,19 @@ pub fn deliver_remote(bytes: &[u8]) {
             bytes.len(), MSG + TAG);
         return;
     }
-    // L6f: HMAC verify BEFORE anything else. Runs in IRQ context (SIE=0);
-    // constant-time compare inside attest::verify. Outermost gate deliberately
-    // - fail-open ordering would leak "node accepted frame far enough to X".
-    // Mismatch is silent to the requester (no reply) and noisy locally.
+    // L7a: MAC verify BEFORE anything else, now under the PER-PEER session key
+    // selected by src_node (the source-MAC hint). Runs in IRQ context (SIE=0);
+    // data-independent compare inside attest::verify_from. Outermost gate,
+    // unchanged ordering from L6f - fail-open would leak "accepted far enough
+    // to X". verify_from is ALSO false when no session exists with src_node
+    // (frame from an un-provisioned / un-discovered node). Silent to sender,
+    // noisy locally.
     let msg_bytes = &bytes[..MSG];
     let mut received_tag = [0u8; TAG];
     received_tag.copy_from_slice(&bytes[MSG..MSG + TAG]);
-    if !crate::attest::verify(msg_bytes, &received_tag) {
-        crate::kprintln!("[IPC] remote: HMAC verify FAILED - dropped ({} bytes)",
-            bytes.len());
+    if !crate::attest::verify_from(src_node, msg_bytes, &received_tag) {
+        crate::kprintln!("[IPC] remote: verify FAILED (node {}, no session or bad tag) - dropped ({} bytes)",
+            src_node, bytes.len());
         return;
     }
     let mut msg = IPCMessage::zero();

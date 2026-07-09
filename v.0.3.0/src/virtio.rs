@@ -292,17 +292,20 @@ pub const VNET_HDR_LEN: usize = 12;
 
 /// Our EtherType: IEEE 802 local-experimental 1. woflOS's slot on the wire.
 pub const ETHERTYPE_WOFL: u16 = 0x88B5;
+/// L7a control plane: HELLO discovery frames. Separate ethertype keeps the
+/// L6f IPC frame byte-identical; rx_parse branches on this before the IPC path.
+pub const ETHERTYPE_HELLO: u16 = 0x88B6;
 
 /// Build hdr+frame into `buf` (PA==VA, device-reachable). Returns total len.
 /// Layout: [12B zeroed vnet hdr][6B dst][6B src][2B ethertype BE][payload]
-fn build_tx(buf: usize, src_mac: &[u8; 6], payload: &[u8]) -> usize {
+fn build_tx(buf: usize, src_mac: &[u8; 6], ethertype: u16, payload: &[u8]) -> usize {
     unsafe {
         core::ptr::write_bytes(buf as *mut u8, 0, VNET_HDR_LEN); // no offloads
         let eth = (buf + VNET_HDR_LEN) as *mut u8;
         for i in 0..6 { eth.add(i).write(0xFF); }                 // dst: broadcast
         for i in 0..6 { eth.add(6 + i).write(src_mac[i]); }       // src: our MAC
-        eth.add(12).write((ETHERTYPE_WOFL >> 8) as u8);           // ethertype,
-        eth.add(13).write(ETHERTYPE_WOFL as u8);                  // big-endian
+        eth.add(12).write((ethertype >> 8) as u8);              // ethertype,
+        eth.add(13).write(ethertype as u8);                       // big-endian (caller picks)
         for (i, b) in payload.iter().enumerate() {
             eth.add(14 + i).write(*b);
         }
@@ -314,8 +317,8 @@ fn build_tx(buf: usize, src_mac: &[u8; 6], payload: &[u8]) -> usize {
 }
 
 /// TX one frame and poll the used ring for completion. Returns used len.
-pub fn tx_one(nic: &mut VirtioNet, tx_buf: usize, payload: &[u8]) -> Result<u32, &'static str> {
-    let total = build_tx(tx_buf, &nic.mac, payload);
+pub fn tx_one(nic: &mut VirtioNet, tx_buf: usize, ethertype: u16, payload: &[u8]) -> Result<u32, &'static str> {
+    let total = build_tx(tx_buf, &nic.mac, ethertype, payload);
 
     // Descriptor 0: the whole buffer, device READS it (no WRITE flag), no chain.
     unsafe {
@@ -397,7 +400,7 @@ pub fn post_rx(nic: &mut VirtioNet, rx_frame: usize) {
 /// Parse one received buffer: skip the 12-byte vnet header (present on RX
 /// exactly as on TX), print the Ethernet triple, and if it is our EtherType,
 /// the payload text.
-fn rx_parse(buf: usize, len: usize) {
+fn rx_parse(nic: &mut VirtioNet, buf: usize, len: usize) {
     if len < VNET_HDR_LEN + 14 {
         crate::kprintln!("[L6] RX: runt ({} bytes) - ignored", len);
         return;
@@ -405,6 +408,24 @@ fn rx_parse(buf: usize, len: usize) {
     let eth = (buf + VNET_HDR_LEN) as *const u8;
     unsafe {
         let ethertype = ((eth.add(12).read() as u16) << 8) | eth.add(13).read() as u16;
+        // L7a: source MAC's last byte is the sender's node id (QEMU sets
+        // 52:54:00:00:00:0X per -device mac=; build_tx copies nic.mac into src).
+        // UNTRUSTED HINT ONLY - it merely selects which session key to try;
+        // verify_from still gates trust, so a lying MAC just fails verify.
+        let src_node = eth.add(11).read() as usize;
+        // L7a: the mcast socket loops our OWN frames back to us. A self-echoed
+        // IPC frame is tagged under a peer key we don't hold for "ourself"
+        // (on_hello rejects src_node==me), so verify_from would correctly drop
+        // it - but noisily, as a "verify FAILED" line that looks like an attack
+        // during later debugging. Drop self-origin frames HERE, before any
+        // branch: self-echo is a link property, not an IPC concern. After this,
+        // a "verify FAILED" line means a REAL auth failure - which is exactly
+        // what the L7a negative test wants it to mean. HELLO self-echo is
+        // already handled inside on_hello, but dropping here covers both planes
+        // uniformly and saves the wasted parse.
+        if src_node == crate::NODE_ID as usize {
+            return;
+        }
         crate::kprintln!(
             "[L6] RX: {} bytes dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} \
 src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} type=0x{:04x}",
@@ -415,6 +436,23 @@ src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} type=0x{:04x}",
             eth.add(9).read(), eth.add(10).read(), eth.add(11).read(),
             ethertype
         );
+        // L7a: HELLO discovery frames (control plane). Handled before the IPC
+        // branch. Payload [subtype 1B][pubkey 32B]. on_hello runs the allowlist
+        // check + DH; if it says this was an allowlisted REQUEST, we REPLY on
+        // the SAME nic borrow (no NIC re-grab - that would alias &mut = UB).
+        if ethertype == ETHERTYPE_HELLO && len >= VNET_HDR_LEN + 14 + 1 + 32 {
+            let pl = eth.add(14);
+            let subtype = pl.read();
+            let mut pubkey = [0u8; 32];
+            for i in 0..32 { pubkey[i] = pl.add(1 + i).read(); }
+            if crate::attest::on_hello(subtype, src_node, &pubkey) {
+                if let Err(e) = hello_tx(nic, crate::attest::HELLO_REPLY) {
+                    crate::kprintln!("[L7a] HELLO reply TX failed: {}", e);
+                }
+            }
+            RX_SEEN.fetch_add(1, Ordering::SeqCst);
+            return;
+        }
         // L6e: magic-prefixed frames carry a serialized IPCMessage.
         if ethertype == ETHERTYPE_WOFL && len >= VNET_HDR_LEN + 14 + 4 + crate::attest::TAG_LEN + core::mem::size_of::<crate::ipc::IPCMessage>() {
             let pl = eth.add(14);
@@ -426,7 +464,7 @@ src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} type=0x{:04x}",
                 // L6f: body now carries [IPCMessage MSG][BLAKE3 tag TAG] -
                 // deliver_remote splits the two internally.
                 let body = core::slice::from_raw_parts(pl.add(4), MSG + TAG);
-                crate::ipc::deliver_remote(body);
+                crate::ipc::deliver_remote(src_node, body);
                 RX_SEEN.fetch_add(1, Ordering::SeqCst);
                 return;
             }
@@ -468,7 +506,7 @@ pub fn handle_irq() {
             nic.rx.last_used = nic.rx.last_used.wrapping_add(1);
 
             let buf = nic.rx.desc_ptr(id).read_volatile().addr as usize;
-            rx_parse(buf, len);
+            rx_parse(nic, buf, len);
 
             // Repost the same descriptor - ring stays full forever.
             let idx = nic.rx.avail_idx().read_volatile();
@@ -493,26 +531,60 @@ const _: () = assert!(
     VNET_HDR_LEN + 14 + 4 + core::mem::size_of::<crate::ipc::IPCMessage>() + crate::attest::TAG_LEN <= RX_BUF_LEN
 );
 
+/// L7a: TX one HELLO discovery frame. Payload [subtype 1B][my pubkey 32B] at
+/// ETHERTYPE_HELLO. Takes the ALREADY-HELD nic borrow (never re-grabs NIC -
+/// two &mut to one static is UB; this is why rx_parse/handle_irq thread nic
+/// down instead). REQUEST solicits+announces; REPLY answers and is terminal.
+pub fn hello_tx(nic: &mut VirtioNet, subtype: u8) -> Result<(), &'static str> {
+    if nic.tx_buf == 0 { return Err("TX buffer not allocated"); }
+    let pk = crate::attest::my_pubkey_bytes();
+    let mut payload = [0u8; 1 + 32];
+    payload[0] = subtype;
+    payload[1..].copy_from_slice(&pk);
+    let buf = nic.tx_buf;
+    tx_one(nic, buf, ETHERTYPE_HELLO, &payload).map(|_| ())
+}
+
+/// L7a: send one HELLO from BOOT context - i.e. when you are NOT already
+/// holding the nic borrow. Grabs NIC.as_mut() for one scoped statement and
+/// drops it. CALLER MUST HAVE SIE=0 when calling this: with interrupts off no
+/// handle_irq can be mid-borrow, so this transient &mut is provably alone (two
+/// &mut to the NIC static would be UB). The reply path in handle_irq does NOT
+/// use this - it already holds nic, so it calls hello_tx directly. This is the
+/// single sanctioned not-holding-nic entry point; that division is the whole
+/// borrow-safety story for the HELLO path.
+pub fn hello_tx_scoped(subtype: u8) -> Result<(), &'static str> {
+    unsafe {
+        let nic = NIC.as_mut().ok_or("NIC not initialised")?;
+        hello_tx(nic, subtype)
+    }
+}
+
 /// TX a serialized IPCMessage. Called from the syscall path (send_remote),
 /// so it runs on the kernel trap stack - the ~370B staging array is fine
 /// against 16 KiB. Polls TX completion like tx_one (interrupt-driven TX is
 /// an optimisation for later; correctness first).
-pub fn net_send_ipc(bytes: &[u8]) -> Result<(), &'static str> {
+pub fn net_send_ipc(dst_node: usize, bytes: &[u8]) -> Result<(), &'static str> {
     const MSG: usize = core::mem::size_of::<crate::ipc::IPCMessage>();
     const TAG: usize = crate::attest::TAG_LEN;
     if bytes.len() != MSG { return Err("bad IPCMessage size"); }
-    // L6f wire layout: ["WOFL" 4B][IPCMessage MSG][BLAKE3 keyed tag TAG]
-    // Tag covers the IPCMessage bytes only - the WOFL magic is framing, not payload.
+    // L7a wire layout unchanged from L6f: ["WOFL" 4B][IPCMessage MSG][tag TAG].
+    // The DIFFERENCE is the key: tag_for selects this peer's SESSION key, not a
+    // global one. No session yet -> refuse to put an un-authenticated frame on
+    // the wire (caller surfaces the error; discovery must precede remote IPC).
+    let tag = match crate::attest::tag_for(dst_node, bytes) {
+        Some(t) => t,
+        None => return Err("no session key for dst node (HELLO not yet exchanged)"),
+    };
     let mut payload = [0u8; 4 + MSG + TAG];
     payload[0..4].copy_from_slice(b"WOFL");
     payload[4..4 + MSG].copy_from_slice(bytes);
-    let tag = crate::attest::tag(bytes);
     payload[4 + MSG..].copy_from_slice(&tag);
     unsafe {
         let nic = NIC.as_mut().ok_or("NIC not initialised")?;
         if nic.tx_buf == 0 { return Err("TX buffer not allocated"); }
         let buf = nic.tx_buf;
-        tx_one(nic, buf, &payload).map(|_| ())
+        tx_one(nic, buf, ETHERTYPE_WOFL, &payload).map(|_| ())
     }
 }
 
@@ -575,7 +647,7 @@ pub fn l6_bringup() {
             post_rx(nic, rx_frame);                          // 1
             crate::plic::enable_irq(crate::plic::IRQ_VIRTIO_NET); // 2
             crate::trap::enable_external();
-            match tx_one(nic, tx_buf, b"woflOS node 0 says hello") { // 3
+            match tx_one(nic, tx_buf, ETHERTYPE_WOFL, b"woflOS node 0 says hello") { // 3
                 Ok(_) => {}
                 Err(e) => { crate::kprintln!("[L6] TX FAILED: {}", e); return; }
             }
