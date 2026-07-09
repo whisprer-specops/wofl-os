@@ -199,13 +199,27 @@ fn send_remote(node_id: u32, msg: &IPCMessage) -> Result<(), IpcError> {
 /// code, this needs a lock FIRST. (Ledger: same entry as ENDPOINTS/TABLE.)
 pub fn deliver_remote(bytes: &[u8]) {
     const MSG: usize = core::mem::size_of::<IPCMessage>();
-    if bytes.len() < MSG {
-        crate::kprintln!("[IPC] remote: short frame ({} bytes) - dropped", bytes.len());
+    const TAG: usize = crate::attest::TAG_LEN;
+    if bytes.len() < MSG + TAG {
+        crate::kprintln!("[IPC] remote: short frame ({} bytes, need {}) - dropped",
+            bytes.len(), MSG + TAG);
+        return;
+    }
+    // L6f: HMAC verify BEFORE anything else. Runs in IRQ context (SIE=0);
+    // constant-time compare inside attest::verify. Outermost gate deliberately
+    // - fail-open ordering would leak "node accepted frame far enough to X".
+    // Mismatch is silent to the requester (no reply) and noisy locally.
+    let msg_bytes = &bytes[..MSG];
+    let mut received_tag = [0u8; TAG];
+    received_tag.copy_from_slice(&bytes[MSG..MSG + TAG]);
+    if !crate::attest::verify(msg_bytes, &received_tag) {
+        crate::kprintln!("[IPC] remote: HMAC verify FAILED - dropped ({} bytes)",
+            bytes.len());
         return;
     }
     let mut msg = IPCMessage::zero();
     unsafe {
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(),
+        core::ptr::copy_nonoverlapping(msg_bytes.as_ptr(),
             &mut msg as *mut IPCMessage as *mut u8, MSG);
     }
     // mcast is a party line: everyone hears everything. Not ours -> silence.

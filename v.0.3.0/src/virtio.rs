@@ -416,13 +416,16 @@ src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} type=0x{:04x}",
             ethertype
         );
         // L6e: magic-prefixed frames carry a serialized IPCMessage.
-        if ethertype == ETHERTYPE_WOFL && len >= VNET_HDR_LEN + 14 + 4 {
+        if ethertype == ETHERTYPE_WOFL && len >= VNET_HDR_LEN + 14 + 4 + crate::attest::TAG_LEN + core::mem::size_of::<crate::ipc::IPCMessage>() {
             let pl = eth.add(14);
             const MSG: usize = core::mem::size_of::<crate::ipc::IPCMessage>();
+            const TAG: usize = crate::attest::TAG_LEN;
             if pl.read() == b'W' && pl.add(1).read() == b'O'
                 && pl.add(2).read() == b'F' && pl.add(3).read() == b'L'
-                && len - VNET_HDR_LEN - 14 - 4 >= MSG {
-                let body = core::slice::from_raw_parts(pl.add(4), MSG);
+                && len - VNET_HDR_LEN - 14 - 4 >= MSG + TAG {
+                // L6f: body now carries [IPCMessage MSG][BLAKE3 tag TAG] -
+                // deliver_remote splits the two internally.
+                let body = core::slice::from_raw_parts(pl.add(4), MSG + TAG);
                 crate::ipc::deliver_remote(body);
                 RX_SEEN.fetch_add(1, Ordering::SeqCst);
                 return;
@@ -487,7 +490,7 @@ pub fn handle_irq() {
 /// Bumping IPC_PAYLOAD_MAX (design target 4096) FAILS THIS BUILD instead of
 /// silently truncating DMA - grow RX_BUF_LEN/buffer scheme together with it.
 const _: () = assert!(
-    VNET_HDR_LEN + 14 + 4 + core::mem::size_of::<crate::ipc::IPCMessage>() <= RX_BUF_LEN
+    VNET_HDR_LEN + 14 + 4 + core::mem::size_of::<crate::ipc::IPCMessage>() + crate::attest::TAG_LEN <= RX_BUF_LEN
 );
 
 /// TX a serialized IPCMessage. Called from the syscall path (send_remote),
@@ -496,10 +499,15 @@ const _: () = assert!(
 /// an optimisation for later; correctness first).
 pub fn net_send_ipc(bytes: &[u8]) -> Result<(), &'static str> {
     const MSG: usize = core::mem::size_of::<crate::ipc::IPCMessage>();
+    const TAG: usize = crate::attest::TAG_LEN;
     if bytes.len() != MSG { return Err("bad IPCMessage size"); }
-    let mut payload = [0u8; 4 + MSG];
+    // L6f wire layout: ["WOFL" 4B][IPCMessage MSG][BLAKE3 keyed tag TAG]
+    // Tag covers the IPCMessage bytes only - the WOFL magic is framing, not payload.
+    let mut payload = [0u8; 4 + MSG + TAG];
     payload[0..4].copy_from_slice(b"WOFL");
-    payload[4..].copy_from_slice(bytes);
+    payload[4..4 + MSG].copy_from_slice(bytes);
+    let tag = crate::attest::tag(bytes);
+    payload[4 + MSG..].copy_from_slice(&tag);
     unsafe {
         let nic = NIC.as_mut().ok_or("NIC not initialised")?;
         if nic.tx_buf == 0 { return Err("TX buffer not allocated"); }
